@@ -236,12 +236,30 @@ async def run_import(
         no_updates=True,
     ) as tg:
         
-        # Hydrate dialogs briefly so Hydrogram learns about private chats not in its DB
+        # ── Peer hydration ────────────────────────────────────────────────────
+        # Hydrogram (like Pyrogram) maintains an internal peer cache. It MUST
+        # "see" a chat before it can resolve its access_hash. For channels the
+        # user has already joined, loading dialogs populates this cache.
+        # With limit=5 only the 5 most recent chats were loaded, causing
+        # PEER_ID_INVALID for any channel not in that tiny window.
+        job.add_log("Hydrating peer cache (loading dialogs)...")
         try:
-            async for _ in tg.get_dialogs(limit=5):
-                pass
-        except Exception:
-            pass
+            dialog_count = 0
+            async for _ in tg.get_dialogs(limit=200):
+                dialog_count += 1
+            job.add_log(f"Loaded {dialog_count} dialogs into peer cache.")
+        except Exception as e:
+            job.add_log(f"Dialog hydration partial/failed: {e}")
+
+        # For numeric channel IDs (e.g. -1001234567890), try to resolve
+        # directly via get_chat() which works even if not in dialogs.
+        for peer_label, peer_val in [("source", src_peer), ("target", tgt_peer)]:
+            if isinstance(peer_val, int):
+                try:
+                    chat = await tg.get_chat(peer_val)
+                    job.add_log(f"Resolved {peer_label} peer: {getattr(chat, 'title', peer_val)}")
+                except Exception as e:
+                    job.add_log(f"Warning: could not pre-resolve {peer_label} ({peer_val}): {e}")
 
         # ── Step 1: Scan or use pre-supplied msg_ids ──────────────────────────
         if msg_ids:

@@ -72,6 +72,12 @@ class SendCodeRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@app.get("/")
+async def root():
+    """Root endpoint — Render health checks hit HEAD / and GET /."""
+    return {"ok": True, "service": "video-importer"}
+
+
 @app.get("/health")
 async def health():
     """Ping endpoint — keep-alive for Render free tier."""
@@ -117,7 +123,9 @@ async def stop_job(req: StopJobRequest, x_api_secret: str = Header(default="")):
 
     job = get_job(req.admin_id)
     if not job:
-        raise HTTPException(status_code=404, detail="No active job for this admin.")
+        # After a redeploy, in-memory jobs are lost. Return gracefully
+        # so the backend doesn't treat this as an error.
+        return {"status": "no_active_job", "message": "No active job (service may have restarted)."}
 
     job.stop_flag = True
     job.status = "stopped"
