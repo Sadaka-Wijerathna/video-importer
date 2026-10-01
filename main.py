@@ -40,7 +40,6 @@ def verify_secret(x_api_secret: str):
 # ── Request Models ────────────────────────────────────────────────────────────
 
 class StartJobRequest(BaseModel):
-    job_id: str                       # Provided by BuddyStore backend
     admin_id: str
     session_string: str               # Pyrogram/Hydrogram StringSession
     source_chat: str                  # @username or chat_id
@@ -93,7 +92,8 @@ async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")
     if existing and existing.status == "running":
         raise HTTPException(status_code=409, detail="Import already running for this admin.")
 
-    job = create_job(req.job_id, req.admin_id)
+    job_id = str(uuid.uuid4())
+    job = create_job(job_id, req.admin_id)
 
     # Fire and forget — runs in background
     asyncio.create_task(run_import(
@@ -114,7 +114,7 @@ async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")
         duplicate_check_url=req.duplicate_check_url,
     ))
 
-    return {"job_id": req.job_id, "status": "started", "total": len(req.msg_ids) or "scanning"}
+    return {"job_id": job_id, "status": "started", "total": len(req.msg_ids) or "scanning"}
 
 
 @app.post("/stop-job")
