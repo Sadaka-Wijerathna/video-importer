@@ -47,6 +47,7 @@ class StartJobRequest(BaseModel):
     webhook_url: str                  # BuddyStore backend progress callback URL
     msg_ids: list[int] = []          # Optional: pre-scanned IDs. If empty, service scans.
     target_bot_db_id: Optional[str] = None
+    job_db_id: Optional[str] = None  # DB job ID from BuddyStore — used in webhook callbacks
     # Import parameters (mirror of mtcute startImport signature)
     skip_existing: bool = True
     last_msg_id: Optional[int] = None         # Checkpoint watermark from DB
@@ -92,7 +93,7 @@ async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")
     if existing and existing.status == "running":
         raise HTTPException(status_code=409, detail="Import already running for this admin.")
 
-    job_id = str(uuid.uuid4())
+    job_id = req.job_db_id or str(uuid.uuid4())
     job = create_job(job_id, req.admin_id)
 
     # Fire and forget — runs in background

@@ -155,6 +155,7 @@ async def scan_channel(
                 "jobId": job.job_id, "adminId": job.admin_id,
                 "status": "running", "progress": 0, "total": scan_tick,
                 "message": f"Scanning... {scan_tick} videos found",
+                "logs": job.logs[-20:],
             })
 
         if len(messages) < 100 or not page_had_new:
@@ -296,6 +297,7 @@ async def run_import(
                 "jobId": job.job_id, "adminId": job.admin_id,
                 "status": "completed", "progress": 0, "total": 0,
                 "message": "No videos found.",
+                "logs": job.logs[-20:],
             })
             return
 
@@ -304,6 +306,7 @@ async def run_import(
             "jobId": job.job_id, "adminId": job.admin_id,
             "status": "running", "progress": 0, "total": total,
             "message": f"Starting import of {total} videos...",
+            "logs": job.logs[-20:],
         })
 
         # ── Step 2: Import loop ───────────────────────────────────────────────
@@ -467,7 +470,7 @@ async def run_import(
             videos_since_cooldown += 1
             job.progress = processed
 
-            should_notify = processed % 5 == 0 or processed >= total
+            should_notify = True  # notify on every video for real-time frontend updates
             if should_notify:
                 await notify_buddystore(webhook_url, {
                     "jobId": job.job_id, "adminId": job.admin_id,
