@@ -1,4 +1,4 @@
-hydrogram==0.1.9
+hydrogram==0.2.0
 tgcrypto
 fastapi
 uvicorn[standard]
