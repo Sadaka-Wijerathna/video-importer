@@ -41,12 +41,19 @@ def verify_secret(x_api_secret: str):
 
 class StartJobRequest(BaseModel):
     admin_id: str
-    session_string: str           # Pyrogram StringSession (Hydrogram format)
-    source_chat: str              # @username or chat_id
-    target_chat: str              # @username or chat_id
-    msg_ids: list[int]            # list of message IDs to import
-    webhook_url: str              # BuddyStore backend endpoint for progress callbacks
+    session_string: str               # Pyrogram/Hydrogram StringSession
+    source_chat: str                  # @username or chat_id
+    target_chat: str                  # @username or chat_id
+    webhook_url: str                  # BuddyStore backend progress callback URL
+    msg_ids: list[int] = []          # Optional: pre-scanned IDs. If empty, service scans.
     target_bot_db_id: Optional[str] = None
+    # Import parameters (mirror of mtcute startImport signature)
+    skip_existing: bool = True
+    last_msg_id: Optional[int] = None         # Checkpoint watermark from DB
+    start_message_id: Optional[int] = None   # Range: oldest message to include
+    end_message_id: Optional[int] = None     # Range: newest message to include
+    limit_count: Optional[int] = None        # Max videos to import
+    duplicate_check_url: Optional[str] = None  # Backend endpoint: GET ?botId&telegramUniqueId
 
 
 class StopJobRequest(BaseModel):
@@ -93,9 +100,15 @@ async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")
         msg_ids=req.msg_ids,
         webhook_url=req.webhook_url,
         target_bot_db_id=req.target_bot_db_id,
+        skip_existing=req.skip_existing,
+        last_msg_id=req.last_msg_id,
+        start_message_id=req.start_message_id,
+        end_message_id=req.end_message_id,
+        limit_count=req.limit_count,
+        duplicate_check_url=req.duplicate_check_url,
     ))
 
-    return {"job_id": job_id, "status": "started", "total": len(req.msg_ids)}
+    return {"job_id": job_id, "status": "started", "total": len(req.msg_ids) or "scanning"}
 
 
 @app.post("/stop-job")
@@ -127,6 +140,16 @@ async def job_status(admin_id: str, x_api_secret: str = Header(default="")):
         "message": job.message,
         "logs": job.logs[-50:],
     }
+
+
+@app.get("/session-status")
+async def session_status(admin_id: str, x_api_secret: str = Header(default="")):
+    """Returns whether a Hydrogram session string exists in the DB for this admin.
+    The backend proxies this via GET /admin/importer/session-status.
+    This endpoint just confirms the Python service is reachable — the actual
+    session presence check is done in importer.routes.ts against the DB."""
+    verify_secret(x_api_secret)
+    return {"ok": True, "admin_id": admin_id}
 
 
 # ── Hydrogram Session Generation ─────────────────────────────────────────────
