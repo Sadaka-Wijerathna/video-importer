@@ -53,7 +53,7 @@ async def is_duplicate(duplicate_check_url: str | None, bot_db_id: str | None,
 async def scan_channel(
     tg: Client,
     job: ImportJob,
-    source_chat: str,
+    source_chat: str | int,
     start_message_id: int | None,
     end_message_id: int | None,
     last_msg_id: int | None,
@@ -216,6 +216,17 @@ async def run_import(
     limit_count: int | None = None,
     duplicate_check_url: str | None = None,
 ):
+    # Parse chat IDs to int if they are numeric (Hydrogram requires int for IDs, str for usernames)
+    try:
+        src_peer = int(source_chat)
+    except ValueError:
+        src_peer = source_chat
+
+    try:
+        tgt_peer = int(target_chat)
+    except ValueError:
+        tgt_peer = target_chat
+
     async with Client(
         name=f"session_{job.admin_id}",
         api_id=api_id,
@@ -224,6 +235,13 @@ async def run_import(
         in_memory=True,
         no_updates=True,
     ) as tg:
+        
+        # Hydrate dialogs briefly so Hydrogram learns about private chats not in its DB
+        try:
+            async for _ in tg.get_dialogs(limit=5):
+                pass
+        except Exception:
+            pass
 
         # ── Step 1: Scan or use pre-supplied msg_ids ──────────────────────────
         if msg_ids:
@@ -231,7 +249,7 @@ async def run_import(
             job.add_log(f"Using {len(final_ids)} pre-supplied message IDs.")
         else:
             final_ids = await scan_channel(
-                tg, job, source_chat,
+                tg, job, src_peer,
                 start_message_id, end_message_id,
                 last_msg_id if skip_existing else None,
                 webhook_url,
@@ -293,7 +311,7 @@ async def run_import(
 
                 try:
                     # Fresh message fetch on every attempt → fresh file reference
-                    msg = await tg.get_messages(source_chat, msg_id)
+                    msg = await tg.get_messages(src_peer, msg_id)
                     if not msg or (not msg.video and not msg.document):
                         job.add_log(f"Skipped msg {msg_id}: no video media.")
                         success = True
@@ -323,7 +341,7 @@ async def run_import(
 
                     # ── Fast forward (works for non-restricted channels) ───────
                     try:
-                        await tg.forward_messages(target_chat, source_chat, msg_id)
+                        await tg.forward_messages(tgt_peer, src_peer, msg_id)
                         job.add_log(f"✓ msg {msg_id} forwarded (fast path)")
                         latest_checkpoint_msg_id = msg_id
                         success = True
@@ -356,9 +374,9 @@ async def run_import(
                         thumb_file = await download_thumbnail(tg, raw_doc, tmp_prefix)
 
                     # ── Upload from disk ───────────────────────────────────────
-                    job.add_log(f"↑ Uploading msg {msg_id} to {target_chat}...")
+                    job.add_log(f"↑ Uploading msg {msg_id} to {tgt_peer}...")
                     send_kwargs: dict = dict(
-                        chat_id=target_chat,
+                        chat_id=tgt_peer,
                         video=tmp_file,
                         caption=caption,
                         duration=duration,
