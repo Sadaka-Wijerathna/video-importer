@@ -1,0 +1,7 @@
+hydrogram==0.1.9
+tgcrypto
+fastapi
+uvicorn[standard]
+httpx
+python-dotenv
+aiofiles

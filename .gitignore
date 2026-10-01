@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual envs
+venv/
+env/
+.venv/
+.env/
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Downloads / temp
+/tmp/
+downloads/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Session files (never commit Telegram sessions!)
+*.session
+*.session-journal
