@@ -17,11 +17,16 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # ── Webhook helper ─────────────────────────────────────────────────────────────
 
+API_SECRET = os.getenv("IMPORTER_API_SECRET", "")
+
 async def notify_buddystore(webhook_url: str, payload: dict):
     """Fire-and-forget progress callback to BuddyStore backend."""
     try:
+        headers = {"x-api-secret": API_SECRET} if API_SECRET else {}
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(webhook_url, json=payload)
+            r = await client.post(webhook_url, json=payload, headers=headers)
+            if r.status_code >= 400:
+                print(f"[webhook] Non-OK response {r.status_code}: {r.text[:200]}", flush=True)
     except Exception as e:
         print(f"[webhook] Failed: {e}", flush=True)
 
