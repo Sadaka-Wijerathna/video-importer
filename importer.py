@@ -5,6 +5,7 @@
 
 import os
 import asyncio
+import subprocess
 import httpx
 from hydrogram import Client
 from hydrogram.errors import FloodWait, FileReferenceExpired
@@ -199,7 +200,57 @@ async def download_thumbnail(tg: Client, doc: raw_types.Document, tmp_prefix: st
             os.unlink(thumb_path)
         return None
     except Exception as e:
-        print(f"[thumb] Failed: {e}", flush=True)
+        print(f"[thumb] Telegram thumb failed: {e}", flush=True)
+        return None
+
+
+def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
+    """Extract a frame from the video at ~1s using ffmpeg. Returns path or None."""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-ss", "1",           # seek to 1 second
+                "-frames:v", "1",     # grab 1 frame
+                "-q:v", "5",          # JPEG quality (lower = better, 2-5 is good)
+                "-vf", "scale='min(320,iw)':-1",  # max 320px wide, keep aspect ratio
+                thumb_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) <= 200 * 1024:
+            return thumb_path
+        # If too large, try again at lower quality
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 200 * 1024:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", video_path,
+                    "-ss", "1",
+                    "-frames:v", "1",
+                    "-q:v", "10",
+                    "-vf", "scale='min(200,iw)':-1",
+                    thumb_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) <= 200 * 1024:
+                return thumb_path
+        if os.path.exists(thumb_path):
+            os.unlink(thumb_path)
+        return None
+    except FileNotFoundError:
+        print("[thumb] ffmpeg not installed — skipping thumbnail generation", flush=True)
+        return None
+    except Exception as e:
+        print(f"[thumb] ffmpeg failed: {e}", flush=True)
+        if os.path.exists(thumb_path):
+            os.unlink(thumb_path)
         return None
 
 
@@ -248,14 +299,14 @@ async def run_import(
         # user has already joined, loading dialogs populates this cache.
         # With limit=5 only the 5 most recent chats were loaded, causing
         # PEER_ID_INVALID for any channel not in that tiny window.
-        job.add_log("Hydrating peer cache (loading dialogs)...")
+        job.add_log("🔄 Loading Telegram dialogs...")
         try:
             dialog_count = 0
             async for _ in tg.get_dialogs(limit=200):
                 dialog_count += 1
-            job.add_log(f"Loaded {dialog_count} dialogs into peer cache.")
+            job.add_log(f"✅ Loaded {dialog_count} dialogs")
         except Exception as e:
-            job.add_log(f"Dialog hydration partial/failed: {e}")
+            job.add_log(f"⚠️ Dialog load partial: {e}")
 
         # For numeric channel IDs (e.g. -1001234567890), try to resolve
         # directly via get_chat() which works even if not in dialogs.
@@ -319,11 +370,13 @@ async def run_import(
         videos_since_cooldown = 0
         latest_checkpoint_msg_id: int | None = None
 
-        for msg_id in final_ids:
+        for idx, msg_id in enumerate(final_ids, 1):
             if job.stop_flag:
                 job.status = "stopped"
-                job.add_log("Stopped by admin.")
+                job.add_log("⏹ Stopped by admin.")
                 break
+
+            tag = f"[{idx}/{total}]"  # progress tag for log readability
 
             success = False
             attempts = 0
@@ -339,7 +392,7 @@ async def run_import(
                     # Fresh message fetch on every attempt → fresh file reference
                     msg = await tg.get_messages(src_peer, msg_id)
                     if not msg or (not msg.video and not msg.document):
-                        job.add_log(f"Skipped msg {msg_id}: no video media.")
+                        job.add_log(f"{tag} Skipped — not a video")
                         success = True
                         break
 
@@ -359,8 +412,7 @@ async def run_import(
                         )
                         if dup:
                             job.add_log(
-                                f"[Duplicate] Skipped msg {msg_id} "
-                                f"(uniqueId: {unique_id}) — already in DB."
+                                f"{tag} Skipped — duplicate already in DB"
                             )
                             success = True
                             break
@@ -368,7 +420,8 @@ async def run_import(
                     # ── Fast forward (works for non-restricted channels) ───────
                     try:
                         await tg.forward_messages(tgt_peer, src_peer, msg_id)
-                        job.add_log(f"✓ msg {msg_id} forwarded (fast path)")
+                        file_size_mb = file_size / (1024 * 1024)
+                        job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB) — forwarded")
                         latest_checkpoint_msg_id = msg_id
                         success = True
                         break
@@ -383,9 +436,7 @@ async def run_import(
 
                     # ── Download to disk ───────────────────────────────────────
                     file_size_mb = file_size / (1024 * 1024)
-                    job.add_log(
-                        f"↓ Downloading msg {msg_id} ({file_size_mb:.1f} MB)..."
-                    )
+                    job.message = f"{tag} Downloading ({file_size_mb:.1f} MB)..."
                     tmp_prefix = os.path.join(
                         DOWNLOADS_DIR, f"{job.admin_id}_{msg_id}"
                     )
@@ -399,8 +450,14 @@ async def run_import(
                     if raw_doc and hasattr(raw_doc, "thumbs"):
                         thumb_file = await download_thumbnail(tg, raw_doc, tmp_prefix)
 
+                    # Fallback: generate thumbnail from the video itself via ffmpeg
+                    if not thumb_file and tmp_file and os.path.exists(tmp_file):
+                        thumb_file = generate_thumbnail_ffmpeg(
+                            tmp_file, f"{tmp_prefix}_thumb.jpg"
+                        )
+
                     # ── Upload from disk ───────────────────────────────────────
-                    job.add_log(f"↑ Uploading msg {msg_id} to {tgt_peer}...")
+                    job.message = f"{tag} Uploading ({file_size_mb:.1f} MB)..."
                     send_kwargs: dict = dict(
                         chat_id=tgt_peer,
                         video=tmp_file,
@@ -415,12 +472,12 @@ async def run_import(
 
                     await tg.send_video(**send_kwargs)
                     latest_checkpoint_msg_id = msg_id
-                    job.add_log(f"✓ msg {msg_id} imported ({file_size_mb:.1f} MB)")
+                    job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB)")
                     success = True
 
                 except FloodWait as fw:
                     wait = fw.value + 3
-                    job.add_log(f"[Flood Wait] msg {msg_id}: waiting {wait}s...")
+                    job.add_log(f"{tag} ⏳ Rate limited — waiting {wait}s...")
                     if fw.value > 3600:
                         # Absurdly long — pause job gracefully
                         job.status = "stopped"
@@ -429,7 +486,7 @@ async def run_import(
                             f"{fw.value // 60} min. Resume later."
                         )
                         job.add_log(
-                            f"[Flood Wait] {fw.value}s — pausing job. Resume manually."
+                            f"{tag} ⏸ Rate limit too long ({fw.value // 60} min) — paused. Resume later."
                         )
                         await notify_buddystore(webhook_url, {
                             "jobId": job.job_id, "adminId": job.admin_id,
@@ -453,13 +510,13 @@ async def run_import(
                     if is_retryable and attempts < max_attempts:
                         backoff = backoff_schedule[attempts - 1]
                         job.add_log(
-                            f"[Retry {attempts}/{max_attempts}] msg {msg_id}: "
-                            f"{err_msg[:80]} — retrying in {backoff}s..."
+                            f"{tag} 🔄 Retry {attempts}/{max_attempts}: "
+                            f"{err_msg[:60]} — waiting {backoff}s..."
                         )
                         await asyncio.sleep(backoff)
                         # Loop continues — next iteration fetches fresh file reference
                     else:
-                        job.add_log(f"✗ msg {msg_id} skipped: {err_msg[:120]}")
+                        job.add_log(f"{tag} ❌ Failed — {err_msg[:100]}")
                         success = True  # skip this video, move on
 
                 finally:
@@ -489,7 +546,7 @@ async def run_import(
             # ── Batch cooldown every 40 videos ────────────────────────────────
             if videos_since_cooldown >= 40 and processed < total:
                 videos_since_cooldown = 0
-                job.add_log("[Cooldown] 40 videos done. Resting 25s...")
+                job.add_log(f"⏳ Batch cooldown — resting 25s ({processed}/{total} done)")
                 await notify_buddystore(webhook_url, {
                     "jobId": job.job_id, "adminId": job.admin_id,
                     "status": "running", "progress": processed, "total": total,
@@ -503,7 +560,7 @@ async def run_import(
         # ── Job finished ──────────────────────────────────────────────────────
         if not job.stop_flag:
             job.status = "completed"
-            job.message = f"Import completed. {processed}/{total} videos processed."
+            job.message = f"✅ Import complete — {processed}/{total} videos imported."
 
         await notify_buddystore(webhook_url, {
             "jobId": job.job_id, "adminId": job.admin_id,
