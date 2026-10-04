@@ -367,8 +367,8 @@ async def run_import(
             "logs": job.logs[-20:],
         })
 
-        # ── Step 2: Concurrent import loop (2 parallel workers) ──────────────
-        CONCURRENCY = 2
+        # ── Step 2: Concurrent import loop (1 parallel worker to save memory on free tier) ──────────────
+        CONCURRENCY = 1
         semaphore = asyncio.Semaphore(CONCURRENCY)
         progress_lock = asyncio.Lock()
 
