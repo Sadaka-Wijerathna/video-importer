@@ -2,6 +2,7 @@
 import os
 import uuid
 import asyncio
+import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -15,6 +16,39 @@ load_dotenv()
 API_SECRET = os.getenv("IMPORTER_API_SECRET", "")  # shared secret with BuddyStore backend
 TG_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 TG_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
+BACKEND_URL = os.getenv("BUDDYSTORE_BACKEND_URL", "https://buddystore-backend.onrender.com")
+
+
+async def _delayed_auto_resume():
+    """
+    Runs 5 seconds after server startup as a background task.
+
+    WHY THE DELAY:
+    The Python server calls Node.js /auto-resume, which immediately calls
+    back /start-job on this service. Without the delay, that callback arrives
+    while FastAPI is still initialising (before yield completes) — so it gets
+    a connection-refused error and the job is never actually restarted.
+    5 seconds is more than enough for uvicorn to bind its port.
+    """
+    await asyncio.sleep(5)
+    print("[startup] Checking for interrupted jobs to auto-resume...", flush=True)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(
+                f"{BACKEND_URL}/api/v1/admin/importer/auto-resume",
+                headers={"x-api-secret": API_SECRET},
+            )
+            if res.status_code == 200:
+                data = res.json()
+                resumed = data.get("resumed", 0)
+                if resumed > 0:
+                    print(f"[startup] ✅ Auto-resumed {resumed} interrupted job(s).", flush=True)
+                else:
+                    print("[startup] No interrupted jobs found — nothing to resume.", flush=True)
+            else:
+                print(f"[startup] Auto-resume signal returned HTTP {res.status_code}", flush=True)
+    except Exception as e:
+        print(f"[startup] Auto-resume signal failed: {e}", flush=True)
 
 
 @asynccontextmanager
@@ -22,24 +56,11 @@ async def lifespan(app: FastAPI):
     print(f"[startup] Video importer ready. API_ID={TG_API_ID}", flush=True)
     if not TG_API_ID or not TG_API_HASH:
         print("[startup] WARNING: TELEGRAM_API_ID or TELEGRAM_API_HASH not set!", flush=True)
-        
-    # Trigger auto-resume in Node.js backend for any jobs that were running when we crashed/restarted
-    backend_url = os.getenv("BUDDYSTORE_BACKEND_URL", "https://buddystore-backend.onrender.com")
-    try:
-        import httpx
-        async with httpx.AsyncClient() as client:
-            res = await client.post(
-                f"{backend_url}/api/v1/admin/importer/auto-resume",
-                headers={"x-api-secret": API_SECRET},
-                timeout=10.0
-            )
-            if res.status_code == 200:
-                data = res.json()
-                print(f"[startup] Auto-resume triggered. Resumed {data.get('resumed', 0)} jobs.", flush=True)
-            else:
-                print(f"[startup] Auto-resume returned status {res.status_code}", flush=True)
-    except Exception as e:
-        print(f"[startup] Auto-resume signal failed: {e}", flush=True)
+
+    # Schedule auto-resume AFTER the server is fully up.
+    # asyncio.create_task() is non-blocking — lifespan continues to yield
+    # immediately so uvicorn can finish binding its port before the callback arrives.
+    asyncio.create_task(_delayed_auto_resume())
 
     yield
 
