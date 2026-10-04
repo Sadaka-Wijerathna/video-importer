@@ -77,12 +77,13 @@ async def scan_channel(
 
     video_ids: list[int] = []
     offset_id = (end_message_id + 1) if end_message_id else 0
-    # Range import: if an explicit start_message_id is provided, use it as the
-    # sole floor so the checkpoint watermark can't silently shrink the range.
+    # Use the highest floor available so we don't re-process videos
+    # we already completed (last_msg_id) or before the user's requested start.
+    floor_id = 0
     if start_message_id:
         floor_id = start_message_id - 1
-    else:
-        floor_id = last_msg_id or 0
+    if last_msg_id and last_msg_id > floor_id:
+        floor_id = last_msg_id
 
     scan_tick = 0
     has_more = True
