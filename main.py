@@ -22,6 +22,25 @@ async def lifespan(app: FastAPI):
     print(f"[startup] Video importer ready. API_ID={TG_API_ID}", flush=True)
     if not TG_API_ID or not TG_API_HASH:
         print("[startup] WARNING: TELEGRAM_API_ID or TELEGRAM_API_HASH not set!", flush=True)
+        
+    # Trigger auto-resume in Node.js backend for any jobs that were running when we crashed/restarted
+    backend_url = os.getenv("BUDDYSTORE_BACKEND_URL", "https://buddystore-backend.onrender.com")
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                f"{backend_url}/api/v1/admin/importer/auto-resume",
+                headers={"x-api-secret": API_SECRET},
+                timeout=10.0
+            )
+            if res.status_code == 200:
+                data = res.json()
+                print(f"[startup] Auto-resume triggered. Resumed {data.get('resumed', 0)} jobs.", flush=True)
+            else:
+                print(f"[startup] Auto-resume returned status {res.status_code}", flush=True)
+    except Exception as e:
+        print(f"[startup] Auto-resume signal failed: {e}", flush=True)
+
     yield
 
 
