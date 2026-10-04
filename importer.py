@@ -208,9 +208,63 @@ async def download_thumbnail(tg: Client, doc: raw_types.Document, tmp_prefix: st
 
 def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
     """Extract a frame from the video at ~1s using ffmpeg. Returns path or None."""
-    # Disabled on free tier to prevent memory spikes (OOM kills).
-    # ffmpeg can easily consume hundreds of MBs of RAM when processing large videos.
-    return None
+    # To prevent OOM on free tier, skip ffmpeg for large videos (> 50MB)
+    try:
+        if os.path.exists(video_path) and os.path.getsize(video_path) > 50 * 1024 * 1024:
+            print("[thumb] Video too large (>50MB), skipping ffmpeg to avoid OOM", flush=True)
+            return None
+    except Exception:
+        pass
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-ss", "1",           # seek to 1 second
+                "-frames:v", "1",     # grab 1 frame
+                "-q:v", "5",          # JPEG quality (lower = better, 2-5 is good)
+                "-vf", "scale='min(320,iw)':-1",  # max 320px wide, keep aspect ratio
+                thumb_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) <= 200 * 1024:
+            return thumb_path
+        # If too large, try again at lower quality
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 200 * 1024:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", video_path,
+                    "-ss", "1",
+                    "-frames:v", "1",
+                    "-q:v", "10",
+                    "-vf", "scale='min(200,iw)':-1",
+                    thumb_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) <= 200 * 1024:
+                return thumb_path
+        if os.path.exists(thumb_path):
+            os.unlink(thumb_path)
+        return None
+    except FileNotFoundError:
+        print("[thumb] ffmpeg not installed — skipping thumbnail generation", flush=True)
+        return None
+    except Exception as e:
+        print(f"[thumb] ffmpeg failed: {e}", flush=True)
+        if os.path.exists(thumb_path):
+            try:
+                os.unlink(thumb_path)
+            except Exception:
+                pass
+        return None
 
 
 # ── Main import loop ───────────────────────────────────────────────────────────
