@@ -270,7 +270,7 @@ def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
 
 # ── Main import loop ───────────────────────────────────────────────────────────
 
-async def run_import(
+async def _run_import_inner(
     job: ImportJob,
     session_string: str,
     api_id: int,
@@ -621,4 +621,43 @@ async def run_import(
             "message": job.message,
             "logs": job.logs[-50:],
             "checkpointMsgId": latest_checkpoint_msg_id,
+        })
+
+async def run_import(
+    job: ImportJob,
+    session_string: str,
+    api_id: int,
+    api_hash: str,
+    source_chat: str,
+    target_chat: str,
+    msg_ids: list[int],
+    webhook_url: str,
+    target_bot_db_id: str | None,
+    skip_existing: bool = True,
+    last_msg_id: int | None = None,
+    start_message_id: int | None = None,
+    end_message_id: int | None = None,
+    limit_count: int | None = None,
+    duplicate_check_url: str | None = None,
+    initial_progress: int = 0,
+    original_total: int = 0,
+):
+    import traceback
+    try:
+        await _run_import_inner(
+            job, session_string, api_id, api_hash, source_chat, target_chat, msg_ids,
+            webhook_url, target_bot_db_id, skip_existing, last_msg_id, start_message_id,
+            end_message_id, limit_count, duplicate_check_url, initial_progress, original_total
+        )
+    except Exception as e:
+        err_msg = traceback.format_exc()
+        job.add_log(f"💥 FATAL ERROR: {e}")
+        print(f"[{job.job_id}] FATAL ERROR:\n{err_msg}", flush=True)
+        job.status = "failed"
+        job.message = f"Failed: {e}"
+        await notify_buddystore(webhook_url, {
+            "jobId": job.job_id, "adminId": job.admin_id,
+            "status": "failed", "progress": initial_progress, "total": original_total,
+            "message": job.message,
+            "logs": job.logs[-50:],
         })

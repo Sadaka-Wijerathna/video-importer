@@ -155,7 +155,16 @@ async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")
 
     existing = get_job(req.admin_id)
     if existing and existing.status == "running":
-        raise HTTPException(status_code=409, detail="Import already running for this admin.")
+        # Allow re-sending the exact same job (resume after crash / auto-resume).
+        # If job_db_id matches the in-memory job, stop the old one gracefully and restart.
+        if req.job_db_id and existing.job_id == req.job_db_id:
+            print(f"[start-job] Re-starting same job {req.job_db_id} — stopping old task first.", flush=True)
+            existing.stop_flag = True
+            existing.status = "stopped"
+            # Small yield so any running coroutine can notice stop_flag
+            await asyncio.sleep(0.1)
+        else:
+            raise HTTPException(status_code=409, detail="Import already running for this admin.")
 
     job_id = req.job_db_id or str(uuid.uuid4())
     job = create_job(job_id, req.admin_id)
