@@ -286,6 +286,8 @@ async def run_import(
     end_message_id: int | None = None,
     limit_count: int | None = None,
     duplicate_check_url: str | None = None,
+    initial_progress: int = 0,
+    original_total: int = 0,
 ):
     # Parse chat IDs to int if they are numeric (Hydrogram requires int for IDs, str for usernames)
     try:
@@ -357,16 +359,27 @@ async def run_import(
             final_ids = final_ids[:limit_count]
             job.add_log(f"Capped to {limit_count} videos (limitCount).")
 
-        total = len(final_ids)
+        num_remaining = len(final_ids)
+        if original_total > 0:
+            total = original_total
+            processed = initial_progress
+        else:
+            total = num_remaining
+            processed = 0
+
         job.total = total
 
-        if total == 0:
+        if num_remaining == 0:
             job.status = "completed"
-            job.message = "No videos found to import."
+            if total == 0:
+                job.message = "No videos found to import."
+            else:
+                job.message = f"✅ Import complete — {processed}/{total} videos imported."
+                
             await notify_buddystore(webhook_url, {
                 "jobId": job.job_id, "adminId": job.admin_id,
-                "status": "completed", "progress": 0, "total": 0,
-                "message": "No videos found.",
+                "status": "completed", "progress": processed, "total": total,
+                "message": job.message,
                 "logs": job.logs[-20:],
             })
             return
@@ -384,7 +397,7 @@ async def run_import(
         semaphore = asyncio.Semaphore(CONCURRENCY)
         progress_lock = asyncio.Lock()
 
-        processed = 0
+        # processed is initialized above
         videos_since_cooldown = 0
         latest_checkpoint_msg_id: int | None = None
 
@@ -392,7 +405,7 @@ async def run_import(
         # We only advance the checkpoint past a contiguous block of completions —
         # so if worker B finishes final_ids[1] before worker A finishes final_ids[0],
         # the checkpoint stays at whatever it was until final_ids[0] is also done.
-        completed_flags: list[bool] = [False] * total
+        completed_flags: list[bool] = [False] * num_remaining
         safe_checkpoint_ptr = -1  # highest index where ALL 0..index are complete
 
         async def process_video(list_idx: int, msg_id: int) -> None:
@@ -402,7 +415,7 @@ async def run_import(
                 if job.stop_flag:
                     return
 
-                tag = f"[{list_idx + 1}/{total}]"
+                tag = f"[{initial_progress + list_idx + 1}/{total}]"
                 success = False
                 attempts = 0
                 max_attempts = 5
@@ -558,7 +571,7 @@ async def run_import(
                 # position as long as the next index is also marked complete.
                 completed_flags[list_idx] = True
                 while (
-                    safe_checkpoint_ptr + 1 < total
+                    safe_checkpoint_ptr + 1 < num_remaining
                     and completed_flags[safe_checkpoint_ptr + 1]
                 ):
                     safe_checkpoint_ptr += 1

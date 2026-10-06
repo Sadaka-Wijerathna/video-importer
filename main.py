@@ -3,6 +3,7 @@ import os
 import uuid
 import asyncio
 import httpx
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
@@ -51,6 +52,25 @@ async def _delayed_auto_resume():
         print(f"[startup] Auto-resume signal failed: {e}", flush=True)
 
 
+async def _cleanup_pending_logins():
+    """Periodically cleans up orphaned Hydrogram login clients."""
+    while True:
+        await asyncio.sleep(60)  # Check every minute
+        now = time.time()
+        expired = []
+        for phone, data in _pending_logins.items():
+            if now - data["timestamp"] > 600:  # 10 minutes timeout
+                expired.append(phone)
+        
+        for phone in expired:
+            data = _pending_logins.pop(phone, None)
+            if data:
+                try:
+                    await data["client"].disconnect()
+                except Exception:
+                    pass
+                print(f"[cleanup] Disconnected orphaned login client for {phone}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print(f"[startup] Video importer ready. API_ID={TG_API_ID}", flush=True)
@@ -61,6 +81,7 @@ async def lifespan(app: FastAPI):
     # asyncio.create_task() is non-blocking — lifespan continues to yield
     # immediately so uvicorn can finish binding its port before the callback arrives.
     asyncio.create_task(_delayed_auto_resume())
+    asyncio.create_task(_cleanup_pending_logins())
 
     yield
 
@@ -95,6 +116,8 @@ class StartJobRequest(BaseModel):
     end_message_id: Optional[int] = None     # Range: newest message to include
     limit_count: Optional[int] = None        # Max videos to import
     duplicate_check_url: Optional[str] = None  # Backend endpoint: GET ?botId&telegramUniqueId
+    initial_progress: int = 0
+    original_total: int = 0
 
 
 class StopJobRequest(BaseModel):
@@ -153,6 +176,8 @@ async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")
         end_message_id=req.end_message_id,
         limit_count=req.limit_count,
         duplicate_check_url=req.duplicate_check_url,
+        initial_progress=req.initial_progress,
+        original_total=req.original_total,
     ))
 
     return {"job_id": job_id, "status": "started", "total": len(req.msg_ids) or "scanning"}
@@ -239,6 +264,7 @@ async def send_code(req: SendCodeRequest, x_api_secret: str = Header(default="")
     _pending_logins[req.phone] = {
         "client": client,
         "phone_hash": sent.phone_code_hash,
+        "timestamp": time.time(),
     }
 
     return {"ok": True, "phone_hash": sent.phone_code_hash}
