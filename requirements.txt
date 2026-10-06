@@ -1,7 +1,7 @@
 hydrogram==0.2.0
 tgcrypto
-fastapi
-uvicorn[standard]
-httpx
-python-dotenv
-aiofiles
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+httpx==0.28.1
+python-dotenv==1.1.0
+aiofiles==24.1.0
