@@ -118,6 +118,7 @@ class StartJobRequest(BaseModel):
     duplicate_check_url: Optional[str] = None  # Backend endpoint: GET ?botId&telegramUniqueId
     initial_progress: int = 0
     original_total: int = 0
+    initial_logs: list[str] = []
 
 
 class StopJobRequest(BaseModel):
@@ -158,6 +159,8 @@ async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")
 
     job_id = req.job_db_id or str(uuid.uuid4())
     job = create_job(job_id, req.admin_id)
+    if req.initial_logs:
+        job.logs = req.initial_logs.copy()
 
     # Fire and forget — runs in background
     asyncio.create_task(run_import(
