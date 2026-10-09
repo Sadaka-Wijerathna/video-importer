@@ -400,6 +400,8 @@ async def _run_import_inner(
         # processed is initialized above
         videos_since_cooldown = 0
         latest_checkpoint_msg_id: int | None = None
+        flood_wait_count = 0          # total FloodWait exceptions hit this session
+        flood_wait_total_seconds = 0  # cumulative seconds spent waiting on FloodWaits
 
         # Safe checkpoint tracking: record which indices in final_ids are done.
         # We only advance the checkpoint past a contiguous block of completions —
@@ -409,7 +411,7 @@ async def _run_import_inner(
         safe_checkpoint_ptr = -1  # highest index where ALL 0..index are complete
 
         async def process_video(list_idx: int, msg_id: int) -> None:
-            nonlocal processed, videos_since_cooldown, latest_checkpoint_msg_id, safe_checkpoint_ptr
+            nonlocal processed, videos_since_cooldown, latest_checkpoint_msg_id, safe_checkpoint_ptr, flood_wait_count, flood_wait_total_seconds
 
             async with semaphore:
                 if job.stop_flag:
@@ -511,7 +513,16 @@ async def _run_import_inner(
 
                     except FloodWait as fw:
                         wait = fw.value + 3
-                        job.add_log(f"{tag} ⏳ Rate limited — waiting {wait}s...")
+                        # ── FloodWait analytics ───────────────────────────────
+                        flood_wait_count += 1
+                        flood_wait_total_seconds += fw.value
+                        fw_mins = flood_wait_total_seconds // 60
+                        fw_secs = flood_wait_total_seconds % 60
+                        job.add_log(
+                            f"{tag} ⏳ Rate limited — waiting {wait}s... "
+                            f"(FloodWait #{flood_wait_count}, "
+                            f"{fw_mins}m {fw_secs}s total this session)"
+                        )
                         if fw.value > 3600:
                             job.status = "stopped"
                             job.message = (
@@ -528,9 +539,21 @@ async def _run_import_inner(
                                 "message": job.message,
                                 "logs": job.logs[-20:],
                                 "checkpointMsgId": latest_checkpoint_msg_id,
+                                "floodWaitCount": flood_wait_count,
+                                "floodWaitTotalSeconds": flood_wait_total_seconds,
                             })
                             return
                         await asyncio.sleep(wait)
+                        # ── Smarter recovery buffer after long FloodWaits ─────
+                        # After a wait >60s the quota window is likely still active.
+                        # A short extra pause reduces the chance of immediately
+                        # re-triggering the same limit on the very next request.
+                        if fw.value > 60:
+                            recovery = min(60, fw.value // 10)  # 10% of wait, max 60s
+                            job.add_log(
+                                f"{tag} 🔄 Recovery buffer +{recovery}s after long flood wait"
+                            )
+                            await asyncio.sleep(recovery)
                         # Don't increment attempts — flood wait is not a failure
 
                     except Exception as e:
@@ -580,27 +603,54 @@ async def _run_import_inner(
 
                 local_processed = processed
                 local_checkpoint = latest_checkpoint_msg_id
+                local_fw_count = flood_wait_count
+                local_fw_total = flood_wait_total_seconds
 
                 # Cooldown every 20 completed videos (was 40 — halved for 2× throughput)
                 if videos_since_cooldown >= 20 and local_processed < total:
                     videos_since_cooldown = 0
                     local_should_cooldown = True
 
-            # Progress callback and cooldown outside the lock
+            # ── Dynamic inter-video delay ─────────────────────────────────────
+            # Delay grows as the job progresses to avoid exhausting Telegram's
+            # per-account upload quota on large imports (1000+ videos).
+            # Formula: 0.8s base + 0.5s per 100 videos done, capped at 5s total.
+            total_done = initial_progress + local_processed
+            dynamic_delay = round(0.8 + min(4.2, (total_done // 100) * 0.5), 1)
+
+            # ── FloodWait analytics summary for webhook ────────────────────────
+            fw_suffix = (
+                f" | ⚠️ FloodWaits: {local_fw_count} "
+                f"({local_fw_total // 60}m {local_fw_total % 60}s total)"
+                if local_fw_count > 0 else ""
+            )
+
+            # Progress callback outside the lock
             await notify_buddystore(webhook_url, {
                 "jobId": job.job_id, "adminId": job.admin_id,
                 "status": "running",
                 "progress": local_processed, "total": total,
-                "message": f"Imported {local_processed}/{total} videos",
+                "message": f"Imported {local_processed}/{total} videos{fw_suffix}",
                 "logs": job.logs[-20:],
                 "checkpointMsgId": local_checkpoint,
+                "floodWaitCount": local_fw_count,
+                "floodWaitTotalSeconds": local_fw_total,
+                "currentDelay": dynamic_delay,
             })
 
             if local_should_cooldown and local_processed < total:
-                job.add_log(f"⏳ Batch cooldown — resting 15s ({local_processed}/{total} done)")
-                await asyncio.sleep(15)   # was 25s every 40 — now 15s every 20
+                fw_note = (
+                    f" | ⚠️ {local_fw_count} FloodWaits so far "
+                    f"({local_fw_total // 60}m {local_fw_total % 60}s total)"
+                    if local_fw_count > 0 else ""
+                )
+                job.add_log(
+                    f"⏳ Batch cooldown — resting 15s "
+                    f"({local_processed}/{total} done, delay={dynamic_delay}s per video{fw_note})"
+                )
+                await asyncio.sleep(15)
             else:
-                await asyncio.sleep(0.8)  # was 1.5s — reduced for 2× throughput
+                await asyncio.sleep(dynamic_delay)
 
         # Launch all tasks; semaphore keeps exactly CONCURRENCY running at once
         job.add_log(f"🚀 Starting concurrent import: {total} videos, {CONCURRENCY} workers.")
