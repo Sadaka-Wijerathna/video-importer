@@ -8,9 +8,21 @@ import asyncio
 import subprocess
 import httpx
 from hydrogram import Client
+import hydrogram.errors
 from hydrogram.errors import FloodWait, FileReferenceExpired
 from hydrogram.raw import functions, types as raw_types
 from jobs import ImportJob
+
+# --- MONKEYPATCH HYDROGRAM FLOOD PREMIUM BUG ---
+# Hydrogram maps error 'FLOOD_PREMIUM_WAIT' to 'FloodPremiumWait' in its rpc_error.py,
+# but forgot to actually define it in `hydrogram.errors`.
+# We define it here at runtime so that `getattr` succeeds and we can catch it as a normal FloodWait.
+if not hasattr(hydrogram.errors, "FloodPremiumWait"):
+    class FloodPremiumWait(FloodWait):
+        ID = "FLOOD_PREMIUM_WAIT"
+    
+    setattr(hydrogram.errors, "FloodPremiumWait", FloodPremiumWait)
+# -----------------------------------------------
 
 DOWNLOADS_DIR = "/tmp/tg_imports"
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
