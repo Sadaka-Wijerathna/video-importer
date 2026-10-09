@@ -14,10 +14,11 @@ from importer import run_import
 
 load_dotenv()
 
-API_SECRET = os.getenv("IMPORTER_API_SECRET", "")  # shared secret with BuddyStore backend
-TG_API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-TG_API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-BACKEND_URL = os.getenv("BUDDYSTORE_BACKEND_URL", "https://buddystore-backend.onrender.com")
+API_SECRET = os.getenv("IMPORTER_API_SECRET") or ""  # shared secret with BuddyStore backend
+_tg_api_id = os.getenv("TELEGRAM_API_ID")
+TG_API_ID = int(_tg_api_id) if _tg_api_id else 0
+TG_API_HASH = os.getenv("TELEGRAM_API_HASH") or ""
+BACKEND_URL = os.getenv("BUDDYSTORE_BACKEND_URL") or "https://buddystore-backend.onrender.com"
 
 
 async def _delayed_auto_resume():
