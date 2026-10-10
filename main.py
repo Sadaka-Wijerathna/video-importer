@@ -138,13 +138,13 @@ class SendCodeRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     """Root endpoint — Render health checks hit HEAD / and GET /."""
     return {"ok": True, "service": "video-importer"}
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     """Ping endpoint — keep-alive for Render free tier."""
     return {"ok": True, "service": "video-importer"}
