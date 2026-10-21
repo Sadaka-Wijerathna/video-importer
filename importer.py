@@ -114,7 +114,7 @@ async def scan_channel(
                     offset_id=offset_id,
                     offset_date=0,
                     add_offset=0,
-                    limit=100,
+                    limit=200,
                     max_id=0,
                     min_id=floor_id,
                     hash=0,
@@ -179,7 +179,7 @@ async def scan_channel(
                 "logs": job.logs[-20:],
             })
 
-        if len(messages) < 100 or not page_had_new:
+        if len(messages) < 200 or not page_had_new:
             has_more = False
 
     # Return in chronological order (oldest first, like original)
@@ -221,10 +221,11 @@ async def download_thumbnail(tg: Client, doc: raw_types.Document, tmp_prefix: st
 
 def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
     """Extract a frame from the video at ~1s using ffmpeg. Returns path or None."""
-    # To prevent OOM on free tier, skip ffmpeg for large videos (> 50MB)
+    # Skip ffmpeg thumbnail generation for very large videos to avoid OOM
+    # Raised from 50MB → 150MB now that we have 1GB RAM (AWS t2.micro vs Render 512MB)
     try:
-        if os.path.exists(video_path) and os.path.getsize(video_path) > 50 * 1024 * 1024:
-            print("[thumb] Video too large (>50MB), skipping ffmpeg to avoid OOM", flush=True)
+        if os.path.exists(video_path) and os.path.getsize(video_path) > 150 * 1024 * 1024:
+            print("[thumb] Video too large (>150MB), skipping ffmpeg to avoid OOM", flush=True)
             return None
     except Exception:
         pass
@@ -330,7 +331,7 @@ async def _run_import_inner(
         job.add_log("🔄 Loading Telegram dialogs...")
         try:
             dialog_count = 0
-            async for _ in tg.get_dialogs(limit=200):
+            async for _ in tg.get_dialogs(limit=500):
                 dialog_count += 1
             job.add_log(f"✅ Loaded {dialog_count} dialogs")
         except Exception as e:
@@ -404,8 +405,8 @@ async def _run_import_inner(
             "logs": job.logs[-20:],
         })
 
-        # ── Step 2: Concurrent import loop (1 parallel worker to save memory on free tier) ──────────────
-        CONCURRENCY = 1
+        # ── Step 2: Concurrent import loop (2 parallel workers — fits in 1GB RAM on AWS) ──────────────
+        CONCURRENCY = 2
         semaphore = asyncio.Semaphore(CONCURRENCY)
         progress_lock = asyncio.Lock()
 
