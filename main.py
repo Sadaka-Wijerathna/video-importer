@@ -19,7 +19,6 @@ _tg_api_id = os.getenv("TELEGRAM_API_ID")
 TG_API_ID = int(_tg_api_id) if _tg_api_id else 0
 TG_API_HASH = os.getenv("TELEGRAM_API_HASH") or ""
 BACKEND_URL = os.getenv("BUDDYSTORE_BACKEND_URL") or "https://buddystore-backend.onrender.com"
-# PORT is set to 7860 on HuggingFace Spaces. On Render it uses $PORT. Uvicorn reads it from CLI.
 
 
 async def _delayed_auto_resume():
@@ -354,10 +353,3 @@ async def generate_session_2fa(req: GenerateSession2FARequest, x_api_secret: str
         except Exception:
             pass
         _pending_logins.pop(req.phone, None)
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8080"))
-    print(f"[main] Starting Uvicorn on 0.0.0.0:{port}...", flush=True)
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")

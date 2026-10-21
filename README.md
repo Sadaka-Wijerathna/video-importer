@@ -1,24 +1,15 @@
----
-title: BuddyStore Video Importer
-emoji: 📹
-colorFrom: blue
-colorTo: purple
-sdk: docker
-pinned: false
-short_description: Telegram video importer microservice for BuddyStore
-startup_duration_timeout: 5m
----
-
 # BuddyStore Video Importer
 
 Python microservice for bulk-importing Telegram videos using **Hydrogram** + **TgCrypto** + **FastAPI**.
+
+Replaces the old `mtcute` (GramJS) implementation to eliminate OOM crashes on Render free tier.
 
 ## Architecture
 
 ```
 Frontend (Vercel)
     └── BuddyStore Backend (Node.js / Render)
-              └── video-importer (this service / HuggingFace Spaces)
+              └── video-importer (this service / Render)
                         └── Telegram MTProto API
 ```
 
@@ -27,7 +18,7 @@ Frontend (Vercel)
 - **[Hydrogram](https://github.com/hydrogram/hydrogram)** — Pyrogram fork for MTProto
 - **[TgCrypto](https://github.com/pyrogram/tgcrypto)** — C-extension crypto acceleration
 - **FastAPI** — async HTTP API
-- **Uvicorn** — ASGI server (port 7860 on HF Spaces)
+- **Uvicorn** — ASGI server
 
 ## Endpoints
 
@@ -41,13 +32,12 @@ Frontend (Vercel)
 | POST | `/stop-job` | Stop active import |
 | GET | `/job-status/{admin_id}` | Live job status |
 
-## Environment Variables (set as Secrets in HF Spaces settings)
+## Environment Variables
 
 ```env
 TELEGRAM_API_ID=...
 TELEGRAM_API_HASH=...
-IMPORTER_API_SECRET=...        # shared secret with BuddyStore backend
-BUDDYSTORE_BACKEND_URL=...     # e.g. https://buddystore-backend.onrender.com
+IMPORTER_API_SECRET=...   # shared secret with BuddyStore backend
 ```
 
 ## Local Development
@@ -60,19 +50,9 @@ cp .env.example .env      # fill in your values
 uvicorn main:app --reload --port 8001
 ```
 
-## Deployment (Hugging Face Spaces)
+## Deployment (Render)
 
-1. Create a new Space at [huggingface.co/new-space](https://huggingface.co/new-space) — pick **Docker** SDK
-2. Add the HF Space as a git remote and push
-3. Set **Secrets** (not env vars) in Space Settings → Repository secrets:
-   - `TELEGRAM_API_ID`
-   - `TELEGRAM_API_HASH`
-   - `IMPORTER_API_SECRET`
-   - `BUDDYSTORE_BACKEND_URL`
-4. Space auto-builds from `Dockerfile` — app runs on port 7860
-
-## Deployment (Render — legacy)
-
-1. Connect repo to Render Web Service, set env vars from `render.yaml`
-2. Build: `pip install -r requirements.txt`
-3. Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+1. Connect this repo to a new Render **Web Service**
+2. Set env vars in Render dashboard (see `render.yaml`)
+3. Build command: `pip install -r requirements.txt`
+4. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
