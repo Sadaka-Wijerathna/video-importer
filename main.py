@@ -354,3 +354,10 @@ async def generate_session_2fa(req: GenerateSession2FARequest, x_api_secret: str
         except Exception:
             pass
         _pending_logins.pop(req.phone, None)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    print(f"[main] Starting Uvicorn on 0.0.0.0:{port}...", flush=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
