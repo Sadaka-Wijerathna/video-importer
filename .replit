@@ -1,0 +1,18 @@
+run = "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"
+entrypoint = "main.py"
+modules = ["python-3.12"]
+
+[nix]
+channel = "stable-24_11"
+
+[nix.packages]
+ffmpeg = "ffmpeg"
+
+[deployment]
+deploymentTarget = "autoscale"
+build = ["sh", "-c", "pip install -r requirements.txt"]
+run = ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+
+[[ports]]
+localPort = 8080
+externalPort = 80

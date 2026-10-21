@@ -31,6 +31,9 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 # ── Webhook helper ─────────────────────────────────────────────────────────────
 
 API_SECRET = os.getenv("IMPORTER_API_SECRET", "")
+# Maximum file size (MB) allowed for download+upload fallback when forwarding is restricted.
+# Set to 0 to disable limit. Default 100MB protects free tier bandwidth quotas.
+MAX_FALLBACK_FILE_SIZE_MB = int(os.getenv("MAX_FALLBACK_FILE_SIZE_MB", "100"))
 
 async def notify_buddystore(webhook_url: str, payload: dict):
     """Fire-and-forget progress callback to BuddyStore backend."""
@@ -479,12 +482,20 @@ async def _run_import_inner(
                             if "CHAT_FORWARDS_RESTRICTED" in fwd_msg or \
                                "you can't forward" in fwd_msg.lower() or \
                                "forbidden" in fwd_msg.lower():
-                                pass  # expected — fall through to download+upload
+                                job.add_log(f"{tag} ⚠️ Forwarding restricted by source chat — falling back to download+upload")
                             else:
                                 raise  # re-raise unexpected errors
 
                         # ── Download to disk ───────────────────────────────────────
                         file_size_mb = file_size / (1024 * 1024)
+                        if MAX_FALLBACK_FILE_SIZE_MB > 0 and file_size_mb > MAX_FALLBACK_FILE_SIZE_MB:
+                            job.add_log(
+                                f"{tag} ⚠️ Skipped: File ({file_size_mb:.1f} MB) exceeds fallback limit "
+                                f"({MAX_FALLBACK_FILE_SIZE_MB} MB) to protect bandwidth quota."
+                            )
+                            success = True
+                            break
+
                         job.message = f"{tag} Downloading ({file_size_mb:.1f} MB)..."
                         tmp_prefix = os.path.join(
                             DOWNLOADS_DIR, f"{job.admin_id}_{msg_id}"
