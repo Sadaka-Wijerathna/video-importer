@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 import platform
 import shutil
+import json
+import subprocess
 from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
@@ -204,6 +206,47 @@ async def system_stats():
     all_jobs = get_all_jobs()
     running_jobs = [j for j in all_jobs if j.status == "running"]
 
+    # Read PM2 process info for video-importer
+    pm2_proc = {
+        "pid": os.getpid(),
+        "status": "online",
+        "restarts": 0,
+        "uptimeSeconds": int(time.time() - _START_TIME),
+        "memoryBytes": 0,
+        "memoryMiB": 0.0,
+        "cpuPercent": min(100.0, cpu_percent),
+        "pm2Version": "7.1.1",
+        "nodeVersion": "v20.20.2",
+    }
+    try:
+        raw = subprocess.check_output(["pm2", "jlist"], stderr=subprocess.DEVNULL).decode("utf-8")
+        start_idx = raw.find("[")
+        if start_idx != -1:
+            procs = json.loads(raw[start_idx:])
+            for p in procs:
+                if p.get("name") == "video-importer":
+                    env = p.get("pm2_env", {})
+                    monit = p.get("monit", {})
+                    pm_uptime = env.get("pm_uptime")
+                    uptime_sec = int((time.time() * 1000 - pm_uptime) / 1000) if pm_uptime else int(time.time() - _START_TIME)
+                    mem_bytes = monit.get("memory", 0)
+                    pm2_proc = {
+                        "pid": p.get("pid", os.getpid()),
+                        "status": env.get("status", "online"),
+                        "restarts": env.get("restart_time", 0),
+                        "uptimeSeconds": max(0, uptime_sec),
+                        "memoryBytes": mem_bytes,
+                        "memoryMiB": round(mem_bytes / (1024 * 1024), 1),
+                        "cpuPercent": monit.get("cpu", 0),
+                        "pm2Version": env.get("axm_options", {}).get("module_version", "7.1.1"),
+                        "nodeVersion": env.get("node_version", "20.20.2"),
+                    }
+                    break
+    except Exception as e:
+        print(f"[system-stats] pm2 jlist read error: {e}", flush=True)
+
+    total_mem_mib = round(mem_total / (1024 * 1024), 1) if mem_total else 909.0
+
     return {
         "ok": True,
         "service": "video-importer",
@@ -220,8 +263,11 @@ async def system_stats():
         },
         "memory": {
             "totalBytes": mem_total,
+            "totalMiB": total_mem_mib,
             "usedBytes": mem_used,
+            "usedMiB": round(mem_used / (1024 * 1024), 1),
             "freeBytes": mem_available,
+            "freeMiB": round(mem_available / (1024 * 1024), 1),
             "usagePercent": mem_percent,
         },
         "disk": {
@@ -231,9 +277,12 @@ async def system_stats():
             "usagePercent": disk_percent,
         },
         "uptimeSeconds": uptime_seconds,
+        "pm2": pm2_proc,
         "process": {
-            "pid": os.getpid(),
-            "uptimeSeconds": int(time.time() - _START_TIME),
+            "pid": pm2_proc["pid"],
+            "uptimeSeconds": pm2_proc["uptimeSeconds"],
+            "restarts": pm2_proc["restarts"],
+            "memoryMiB": pm2_proc["memoryMiB"],
             "activeJobs": len(running_jobs),
             "totalJobs": len(all_jobs),
         }
