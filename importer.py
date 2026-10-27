@@ -30,18 +30,22 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 # ── Webhook helper ─────────────────────────────────────────────────────────────
 
-API_SECRET = os.getenv("IMPORTER_API_SECRET", "")
+def _get_api_secret() -> str:
+    return os.getenv("IMPORTER_API_SECRET", "")
 
 async def notify_buddystore(webhook_url: str, payload: dict):
     """Fire-and-forget progress callback to BuddyStore backend."""
     try:
-        headers = {"x-api-secret": API_SECRET} if API_SECRET else {}
+        secret = _get_api_secret()
+        headers = {"x-api-secret": secret} if secret else {}
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(webhook_url, json=payload, headers=headers)
             if r.status_code >= 400:
-                print(f"[webhook] Non-OK response {r.status_code}: {r.text[:200]}", flush=True)
+                print(f"[webhook] To {webhook_url} Non-OK response {r.status_code}: {r.text[:200]}", flush=True)
+            else:
+                print(f"[webhook] ✅ Progress updated: {payload.get('progress')}/{payload.get('total')}", flush=True)
     except Exception as e:
-        print(f"[webhook] Failed: {e}", flush=True)
+        print(f"[webhook] Failed to {webhook_url}: {e}", flush=True)
 
 
 # ── Duplicate check helper ─────────────────────────────────────────────────────
@@ -58,8 +62,10 @@ async def is_duplicate(duplicate_check_url: str | None, bot_db_id: str | None,
         else:
             params["fileSize"] = str(file_size)
             params["duration"] = str(duration)
+        secret = _get_api_secret()
+        headers = {"x-api-secret": secret} if secret else {}
         async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(duplicate_check_url, params=params)
+            r = await client.get(duplicate_check_url, params=params, headers=headers)
             return r.json().get("isDuplicate", False)
     except Exception as e:
         print(f"[dedup] check failed: {e}", flush=True)
@@ -80,24 +86,29 @@ async def scan_channel(
     """
     Iterate messages.getHistory newest→oldest and collect video message IDs.
 
-    Strategy mirrors the original mtcute implementation exactly:
-      • offsetId = end_message_id + 1  (ceiling, 0 = newest)
-      • minId    = max(last_msg_id, start_message_id - 1)  (floor)
+    Strategy:
+      • offset_id = end_message_id + 1  (ceiling, 0 = newest)
+      • floor_id  = max(last_msg_id, start_message_id - 1)  (floor)
+      • Telegram API returns up to 100 messages per getHistory call.
     """
     job.add_log("Scanning channel for videos...")
     job.message = "Scanning..."
 
     video_ids: list[int] = []
     offset_id = (end_message_id + 1) if end_message_id else 0
-    # Use the highest floor available so we don't re-process videos
-    # we already completed (last_msg_id) or before the user's requested start.
     floor_id = 0
     if start_message_id:
         floor_id = start_message_id - 1
     if last_msg_id and last_msg_id > floor_id:
         floor_id = last_msg_id
 
-    scan_tick = 0
+    # Resolve peer once before loop
+    try:
+        peer = await tg.resolve_peer(source_chat)
+    except Exception as e:
+        job.add_log(f"Warning: resolve_peer failed ({e}), will retry in loop")
+        peer = source_chat
+
     has_more = True
 
     while has_more:
@@ -105,8 +116,9 @@ async def scan_channel(
             break
 
         try:
-            # Resolve peer fresh each page (safe for usernames and IDs)
-            peer = await tg.resolve_peer(source_chat)
+            # Re-resolve if needed
+            if isinstance(peer, (str, int)):
+                peer = await tg.resolve_peer(source_chat)
 
             result = await tg.invoke(
                 functions.messages.GetHistory(
@@ -114,7 +126,7 @@ async def scan_channel(
                     offset_id=offset_id,
                     offset_date=0,
                     add_offset=0,
-                    limit=200,
+                    limit=100,
                     max_id=0,
                     min_id=floor_id,
                     hash=0,
@@ -133,19 +145,17 @@ async def scan_channel(
         if not messages:
             break
 
-        page_had_new = False
+        reached_floor = False
         for msg in messages:
             if job.stop_flag:
                 break
             if not hasattr(msg, "id"):
                 continue
             if msg.id <= floor_id:
-                has_more = False
+                reached_floor = True
                 break
             if end_message_id and msg.id > end_message_id:
                 continue
-
-            page_had_new = True
 
             # Check for video media
             if not hasattr(msg, "media") or not msg.media:
@@ -163,23 +173,31 @@ async def scan_channel(
                 )
                 if is_video:
                     video_ids.append(msg.id)
-                    scan_tick += 1
 
-        # Advance offset to the oldest message in this page
-        if messages:
-            offset_id = messages[-1].id
+        if reached_floor or job.stop_flag:
+            break
 
-        if scan_tick % 200 == 0 and scan_tick > 0:
-            job.message = f"Scanning... {scan_tick} found"
-            job.total = scan_tick
-            await notify_buddystore(webhook_url, {
-                "jobId": job.job_id, "adminId": job.admin_id,
-                "status": "running", "progress": 0, "total": scan_tick,
-                "message": f"Scanning... {scan_tick} videos found",
-                "logs": job.logs[-20:],
-            })
+        oldest_msg_id = messages[-1].id
+        # Prevent infinite loop if offset does not advance
+        if offset_id > 0 and oldest_msg_id >= offset_id:
+            break
 
-        if len(messages) < 200 or not page_had_new:
+        offset_id = oldest_msg_id
+
+        # Update progress on every page
+        job.message = f"Scanning... {len(video_ids)} videos found"
+        job.total = len(video_ids)
+        await notify_buddystore(webhook_url, {
+            "jobId": job.job_id, "adminId": job.admin_id,
+            "status": "running", "progress": 0, "total": len(video_ids),
+            "message": f"Scanning... {len(video_ids)} videos found",
+            "logs": job.logs[-20:],
+        })
+
+        # Telegram getHistory limit is 100.
+        # If fewer than 100 messages returned, channel beginning is reached.
+        # If the oldest message on this page is <= floor_id, floor is reached.
+        if len(messages) < 100 or oldest_msg_id <= floor_id:
             has_more = False
 
     # Return in chronological order (oldest first, like original)

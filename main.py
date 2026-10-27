@@ -9,10 +9,10 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from typing import Optional
 from dotenv import load_dotenv
+load_dotenv()
+
 from jobs import get_job, create_job, remove_job
 from importer import run_import
-
-load_dotenv()
 
 API_SECRET = os.getenv("IMPORTER_API_SECRET") or ""  # shared secret with BuddyStore backend
 _tg_api_id = os.getenv("TELEGRAM_API_ID")
