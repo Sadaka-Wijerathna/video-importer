@@ -40,5 +40,10 @@ def create_job(job_id: str, admin_id: str) -> ImportJob:
     return job
 
 
+def get_all_jobs() -> list[ImportJob]:
+    return list(_jobs.values())
+
+
 def remove_job(admin_id: str):
     _jobs.pop(admin_id, None)
+

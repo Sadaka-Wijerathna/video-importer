@@ -7,11 +7,15 @@ import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
+import platform
+import shutil
 from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-from jobs import get_job, create_job, remove_job
+_START_TIME = time.time()
+
+from jobs import get_job, create_job, remove_job, get_all_jobs
 from importer import run_import
 
 API_SECRET = os.getenv("IMPORTER_API_SECRET") or ""  # shared secret with BuddyStore backend
@@ -148,6 +152,92 @@ async def root():
 async def health():
     """Ping endpoint — keep-alive for Render free tier."""
     return {"ok": True, "service": "video-importer"}
+
+
+@app.get("/system-stats")
+async def system_stats():
+    """Returns realtime server metrics for admin dashboard."""
+    # CPU
+    try:
+        load1, load5, load15 = os.getloadavg()
+    except Exception:
+        load1, load5, load15 = 0.0, 0.0, 0.0
+    cpu_count = os.cpu_count() or 1
+    cpu_percent = round((load1 / cpu_count) * 100, 1)
+
+    # Memory
+    mem_total = 0
+    mem_available = 0
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    mem_total = int(line.split()[1]) * 1024
+                elif line.startswith("MemAvailable:"):
+                    mem_available = int(line.split()[1]) * 1024
+        mem_used = max(0, mem_total - mem_available)
+        mem_percent = round((mem_used / mem_total) * 100, 1) if mem_total else 0
+    except Exception:
+        mem_total = 1024 * 1024 * 1024
+        mem_used = 0
+        mem_available = 1024 * 1024 * 1024
+        mem_percent = 0
+
+    # Disk
+    try:
+        disk = shutil.disk_usage("/")
+        disk_total = disk.total
+        disk_used = disk.used
+        disk_free = disk.free
+        disk_percent = round((disk_used / disk_total) * 100, 1) if disk_total else 0
+    except Exception:
+        disk_total, disk_used, disk_free, disk_percent = 0, 0, 0, 0
+
+    # System Uptime
+    uptime_seconds = 0
+    try:
+        with open("/proc/uptime", "r") as f:
+            uptime_seconds = int(float(f.readline().split()[0]))
+    except Exception:
+        pass
+
+    all_jobs = get_all_jobs()
+    running_jobs = [j for j in all_jobs if j.status == "running"]
+
+    return {
+        "ok": True,
+        "service": "video-importer",
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "arch": platform.machine(),
+        "pythonVersion": platform.python_version(),
+        "cpu": {
+            "cores": cpu_count,
+            "load1": round(load1, 2),
+            "load5": round(load5, 2),
+            "load15": round(load15, 2),
+            "usagePercent": min(100.0, cpu_percent),
+        },
+        "memory": {
+            "totalBytes": mem_total,
+            "usedBytes": mem_used,
+            "freeBytes": mem_available,
+            "usagePercent": mem_percent,
+        },
+        "disk": {
+            "totalBytes": disk_total,
+            "usedBytes": disk_used,
+            "freeBytes": disk_free,
+            "usagePercent": disk_percent,
+        },
+        "uptimeSeconds": uptime_seconds,
+        "process": {
+            "pid": os.getpid(),
+            "uptimeSeconds": int(time.time() - _START_TIME),
+            "activeJobs": len(running_jobs),
+            "totalJobs": len(all_jobs),
+        }
+    }
 
 
 @app.post("/start-job")
