@@ -68,6 +68,9 @@ _prom_net_tx = Gauge(
     registry=_PROM_REGISTRY,
 )
 
+# In-memory network speed delta tracker
+_last_net_sample = None  # (timestamp, rx_bytes, tx_bytes)
+
 from jobs import get_job, create_job, remove_job, get_all_jobs
 from importer import run_import
 
@@ -260,6 +263,7 @@ async def system_stats():
     disk = psutil.disk_usage("/")
 
     # ── Network I/O — bytes/sec ───────────────────────────────────────────────
+    global _last_net_sample
     net_io = psutil.net_io_counters(pernic=True)
     # Pick first non-loopback interface
     net_primary = None
@@ -271,6 +275,19 @@ async def system_stats():
             break
     if net_primary is None and net_io:
         net_iface, net_primary = next(iter(net_io.items()))
+
+    now_ts = time.time()
+    rx_bytes_total = net_primary.bytes_recv if net_primary else 0
+    tx_bytes_total = net_primary.bytes_sent if net_primary else 0
+    rx_sec = 0
+    tx_sec = 0
+    if _last_net_sample and net_primary:
+        dt = now_ts - _last_net_sample[0]
+        if 1.0 <= dt <= 120.0:
+            rx_sec = int(max(0, rx_bytes_total - _last_net_sample[1]) / dt)
+            tx_sec = int(max(0, tx_bytes_total - _last_net_sample[2]) / dt)
+    if net_primary:
+        _last_net_sample = (now_ts, rx_bytes_total, tx_bytes_total)
 
     # ── This process stats ────────────────────────────────────────────────────
     try:
@@ -351,8 +368,10 @@ async def system_stats():
         # Network I/O — new! Shows real bytes/sec through NIC
         "network": {
             "interface": net_iface,
-            "rxBytesTotal": net_primary.bytes_recv if net_primary else 0,
-            "txBytesTotal": net_primary.bytes_sent if net_primary else 0,
+            "rxBytesTotal": rx_bytes_total,
+            "txBytesTotal": tx_bytes_total,
+            "rxBytesPerSec": rx_sec,
+            "txBytesPerSec": tx_sec,
             "rxPacketsTotal": net_primary.packets_recv if net_primary else 0,
             "txPacketsTotal": net_primary.packets_sent if net_primary else 0,
             "rxErrors": net_primary.errin if net_primary else 0,
