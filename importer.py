@@ -25,7 +25,10 @@ if not hasattr(hydrogram.errors, "FloodPremiumWait"):
     setattr(hydrogram.errors, "FloodPremiumWait", FloodPremiumWait)
 # -----------------------------------------------
 
-DOWNLOADS_DIR = "/tmp/tg_imports"
+DOWNLOADS_DIR = os.getenv(
+    "DOWNLOADS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads"),
+)
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 
 
