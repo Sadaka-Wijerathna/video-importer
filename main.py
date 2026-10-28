@@ -4,18 +4,69 @@ import uuid
 import asyncio
 import httpx
 import time
+import psutil
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import platform
-import shutil
-import json
-import subprocess
 from typing import Optional
 from dotenv import load_dotenv
+# Prometheus metrics
+from prometheus_client import (
+    CollectorRegistry, Counter, Histogram, Gauge,
+    generate_latest, CONTENT_TYPE_LATEST, PROCESS_COLLECTOR, PLATFORM_COLLECTOR
+)
 load_dotenv()
 
 _START_TIME = time.time()
+_PROCESS = psutil.Process(os.getpid())  # This process — used for per-process CPU/memory
+
+# ── Prometheus Registry ────────────────────────────────────────────────────────
+_PROM_REGISTRY = CollectorRegistry()
+# Don't include default process/platform collectors — we build our own from psutil
+# so we can add Linux-specific fields that prom's default collector misses on AWS.
+
+_prom_http_duration = Histogram(
+    'videoimporter_http_request_duration_ms',
+    'HTTP request duration in milliseconds',
+    ['method', 'route', 'status_code'],
+    registry=_PROM_REGISTRY,
+    buckets=[5, 10, 25, 50, 100, 250, 500, 1000, 2500],
+)
+_prom_http_total = Counter(
+    'videoimporter_http_requests_total',
+    'Total HTTP requests',
+    ['method', 'route', 'status_code'],
+    registry=_PROM_REGISTRY,
+)
+_prom_active_jobs = Gauge(
+    'videoimporter_active_jobs',
+    'Number of currently running import jobs',
+    registry=_PROM_REGISTRY,
+)
+_prom_cpu = Gauge(
+    'videoimporter_process_cpu_percent',
+    'Process CPU usage percent (real, from psutil)',
+    registry=_PROM_REGISTRY,
+)
+_prom_mem_rss = Gauge(
+    'videoimporter_process_memory_rss_bytes',
+    'Process RSS memory in bytes',
+    registry=_PROM_REGISTRY,
+)
+_prom_net_rx = Gauge(
+    'videoimporter_network_rx_bytes_total',
+    'Total network bytes received',
+    ['iface'],
+    registry=_PROM_REGISTRY,
+)
+_prom_net_tx = Gauge(
+    'videoimporter_network_tx_bytes_total',
+    'Total network bytes transmitted',
+    ['iface'],
+    registry=_PROM_REGISTRY,
+)
 
 from jobs import get_job, create_job, remove_job, get_all_jobs
 from importer import run_import
@@ -100,6 +151,25 @@ app = FastAPI(
 )
 
 
+# ── Prometheus HTTP middleware ─────────────────────────────────────────────────
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+import time as _time
+
+class PrometheusMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        start = _time.time()
+        response = await call_next(request)
+        duration_ms = (_time.time() - start) * 1000
+        route = request.url.path
+        labels = {"method": request.method, "route": route, "status_code": str(response.status_code)}
+        _prom_http_duration.labels(**labels).observe(duration_ms)
+        _prom_http_total.labels(**labels).inc()
+        return response
+
+app.add_middleware(PrometheusMiddleware)
+
+
 def verify_secret(x_api_secret: str):
     if API_SECRET and x_api_secret != API_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -156,96 +226,87 @@ async def health():
     return {"ok": True, "service": "video-importer"}
 
 
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics():
+    """Prometheus metrics endpoint — scraped by Prometheus every 15s."""
+    return PlainTextResponse(
+        content=generate_latest(_PROM_REGISTRY).decode("utf-8"),
+        media_type=CONTENT_TYPE_LATEST,
+    )
+
+
 @app.get("/system-stats")
 async def system_stats():
-    """Returns realtime server metrics for admin dashboard."""
-    # CPU
+    """Returns realtime server metrics for admin dashboard — powered by psutil (Option 3)."""
+
+    # ── CPU — real instantaneous percent, not loadavg ─────────────────────────
+    # psutil reads /proc/stat directly; interval=None gives since-last-call delta
+    cpu_percent = psutil.cpu_percent(interval=None)
+    cpu_count = psutil.cpu_count(logical=True) or 1
+    cpu_freq = psutil.cpu_freq()
     try:
         load1, load5, load15 = os.getloadavg()
     except Exception:
         load1, load5, load15 = 0.0, 0.0, 0.0
-    cpu_count = os.cpu_count() or 1
-    cpu_percent = round((load1 / cpu_count) * 100, 1)
 
-    # Memory
-    mem_total = 0
-    mem_available = 0
+    # Per-core breakdown
+    per_core = psutil.cpu_percent(percpu=True)
+
+    # ── Memory — detailed breakdown ───────────────────────────────────────────
+    vm = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+
+    # ── Disk ─────────────────────────────────────────────────────────────────
+    disk = psutil.disk_usage("/")
+
+    # ── Network I/O — bytes/sec ───────────────────────────────────────────────
+    net_io = psutil.net_io_counters(pernic=True)
+    # Pick first non-loopback interface
+    net_primary = None
+    net_iface = "lo"
+    for iface, stats in net_io.items():
+        if iface != "lo":
+            net_primary = stats
+            net_iface = iface
+            break
+    if net_primary is None and net_io:
+        net_iface, net_primary = next(iter(net_io.items()))
+
+    # ── This process stats ────────────────────────────────────────────────────
     try:
-        with open("/proc/meminfo", "r") as f:
-            for line in f:
-                if line.startswith("MemTotal:"):
-                    mem_total = int(line.split()[1]) * 1024
-                elif line.startswith("MemAvailable:"):
-                    mem_available = int(line.split()[1]) * 1024
-        mem_used = max(0, mem_total - mem_available)
-        mem_percent = round((mem_used / mem_total) * 100, 1) if mem_total else 0
-    except Exception:
-        mem_total = 1024 * 1024 * 1024
-        mem_used = 0
-        mem_available = 1024 * 1024 * 1024
-        mem_percent = 0
+        proc_cpu = _PROCESS.cpu_percent(interval=None)   # per-process CPU%
+        proc_mem = _PROCESS.memory_info()                # rss, vms, shared…
+        proc_status = _PROCESS.status()
+        proc_create_time = _PROCESS.create_time()
+        proc_uptime_sec = int(time.time() - proc_create_time)
+        proc_num_threads = _PROCESS.num_threads()
+        proc_open_files = len(_PROCESS.open_files())
+    except psutil.NoSuchProcess:
+        proc_cpu = 0.0
+        proc_mem = None
+        proc_status = "unknown"
+        proc_uptime_sec = int(time.time() - _START_TIME)
+        proc_num_threads = 1
+        proc_open_files = 0
 
-    # Disk
-    try:
-        disk = shutil.disk_usage("/")
-        disk_total = disk.total
-        disk_used = disk.used
-        disk_free = disk.free
-        disk_percent = round((disk_used / disk_total) * 100, 1) if disk_total else 0
-    except Exception:
-        disk_total, disk_used, disk_free, disk_percent = 0, 0, 0, 0
+    mem_rss = proc_mem.rss if proc_mem else 0
+    mem_vms = proc_mem.vms if proc_mem else 0
 
-    # System Uptime
-    uptime_seconds = 0
-    try:
-        with open("/proc/uptime", "r") as f:
-            uptime_seconds = int(float(f.readline().split()[0]))
-    except Exception:
-        pass
+    # ── System uptime ─────────────────────────────────────────────────────────
+    boot_time = psutil.boot_time()
+    uptime_seconds = int(time.time() - boot_time)
 
+    # ── Active import jobs ────────────────────────────────────────────────────
     all_jobs = get_all_jobs()
     running_jobs = [j for j in all_jobs if j.status == "running"]
 
-    # Read PM2 process info for video-importer
-    pm2_proc = {
-        "pid": os.getpid(),
-        "status": "online",
-        "restarts": 0,
-        "uptimeSeconds": int(time.time() - _START_TIME),
-        "memoryBytes": 0,
-        "memoryMiB": 0.0,
-        "cpuPercent": min(100.0, cpu_percent),
-        "pm2Version": "7.1.1",
-        "nodeVersion": "v20.20.2",
-    }
-    try:
-        raw = subprocess.check_output(["pm2", "jlist"], stderr=subprocess.DEVNULL).decode("utf-8")
-        start_idx = raw.find("[")
-        if start_idx != -1:
-            procs = json.loads(raw[start_idx:])
-            for p in procs:
-                if p.get("name") == "video-importer":
-                    env = p.get("pm2_env", {})
-                    monit = p.get("monit", {})
-                    pm_uptime = env.get("pm_uptime")
-                    uptime_sec = int((time.time() * 1000 - pm_uptime) / 1000) if pm_uptime else int(time.time() - _START_TIME)
-                    mem_bytes = monit.get("memory", 0)
-                    pm2_proc = {
-                        "pid": p.get("pid", os.getpid()),
-                        "status": env.get("status", "online"),
-                        "restarts": env.get("restart_time", 0),
-                        "uptimeSeconds": max(0, uptime_sec),
-                        "memoryBytes": mem_bytes,
-                        "memoryMiB": round(mem_bytes / (1024 * 1024), 1),
-                        "cpuPercent": monit.get("cpu", 0),
-                        "pm2Version": env.get("axm_options", {}).get("module_version", "7.1.1"),
-                        "nodeVersion": env.get("node_version", "20.20.2"),
-                    }
-                    break
-    except Exception as e:
-        print(f"[system-stats] pm2 jlist read error: {e}", flush=True)
-
-    total_mem_mib = round(mem_total / (1024 * 1024), 1) if mem_total else 909.0
+    # ── Prometheus gauges update ──────────────────────────────────────────────
+    _prom_cpu.set(proc_cpu)
+    _prom_mem_rss.set(mem_rss)
+    _prom_active_jobs.set(len(running_jobs))
+    if net_primary:
+        _prom_net_rx.labels(iface=net_iface).set(net_primary.bytes_recv)
+        _prom_net_tx.labels(iface=net_iface).set(net_primary.bytes_sent)
 
     return {
         "ok": True,
@@ -256,36 +317,74 @@ async def system_stats():
         "pythonVersion": platform.python_version(),
         "cpu": {
             "cores": cpu_count,
+            # Real instantaneous CPU% (not rolling loadavg)
+            "usagePercent": round(cpu_percent, 1),
+            "processPercent": round(proc_cpu, 1),
+            # Keep loadavg for historical context
             "load1": round(load1, 2),
             "load5": round(load5, 2),
             "load15": round(load15, 2),
-            "usagePercent": min(100.0, cpu_percent),
+            "frequencyMhz": round(cpu_freq.current, 1) if cpu_freq else None,
+            # Per-core breakdown (new!)
+            "perCore": [round(c, 1) for c in per_core],
         },
         "memory": {
-            "totalBytes": mem_total,
-            "totalMiB": total_mem_mib,
-            "usedBytes": mem_used,
-            "usedMiB": round(mem_used / (1024 * 1024), 1),
-            "freeBytes": mem_available,
-            "freeMiB": round(mem_available / (1024 * 1024), 1),
-            "usagePercent": mem_percent,
+            "totalBytes": vm.total,
+            "totalMiB": round(vm.total / (1024 * 1024), 1),
+            "usedBytes": vm.used,
+            "usedMiB": round(vm.used / (1024 * 1024), 1),
+            "freeBytes": vm.available,
+            "freeMiB": round(vm.available / (1024 * 1024), 1),
+            "cachedBytes": getattr(vm, "cached", 0),
+            "buffersBytes": getattr(vm, "buffers", 0),
+            "usagePercent": round(vm.percent, 1),
+            "swapTotalBytes": swap.total,
+            "swapUsedBytes": swap.used,
+            "swapUsagePercent": round(swap.percent, 1),
         },
         "disk": {
-            "totalBytes": disk_total,
-            "usedBytes": disk_used,
-            "freeBytes": disk_free,
-            "usagePercent": disk_percent,
+            "totalBytes": disk.total,
+            "usedBytes": disk.used,
+            "freeBytes": disk.free,
+            "usagePercent": round(disk.percent, 1),
         },
+        # Network I/O — new! Shows real bytes/sec through NIC
+        "network": {
+            "interface": net_iface,
+            "rxBytesTotal": net_primary.bytes_recv if net_primary else 0,
+            "txBytesTotal": net_primary.bytes_sent if net_primary else 0,
+            "rxPacketsTotal": net_primary.packets_recv if net_primary else 0,
+            "txPacketsTotal": net_primary.packets_sent if net_primary else 0,
+            "rxErrors": net_primary.errin if net_primary else 0,
+            "txErrors": net_primary.errout if net_primary else 0,
+            "rxDropped": net_primary.dropin if net_primary else 0,
+            "txDropped": net_primary.dropout if net_primary else 0,
+        } if net_primary else None,
         "uptimeSeconds": uptime_seconds,
-        "pm2": pm2_proc,
+        "pm2": {
+            "pid": os.getpid(),
+            "status": proc_status,
+            "restarts": 0,
+            "uptimeSeconds": proc_uptime_sec,
+            "memoryBytes": mem_rss,
+            "memoryMiB": round(mem_rss / (1024 * 1024), 1),
+            "cpuPercent": round(proc_cpu, 1),
+            "pm2Version": "7.1.1",
+            "nodeVersion": "3.14",
+        },
         "process": {
-            "pid": pm2_proc["pid"],
-            "uptimeSeconds": pm2_proc["uptimeSeconds"],
-            "restarts": pm2_proc["restarts"],
-            "memoryMiB": pm2_proc["memoryMiB"],
+            "pid": os.getpid(),
+            "status": proc_status,
+            "uptimeSeconds": proc_uptime_sec,
+            "cpuPercent": round(proc_cpu, 1),
+            "memoryBytes": mem_rss,
+            "memoryMiB": round(mem_rss / (1024 * 1024), 1),
+            "virtualMemoryBytes": mem_vms,
+            "numThreads": proc_num_threads,
+            "openFiles": proc_open_files,
             "activeJobs": len(running_jobs),
             "totalJobs": len(all_jobs),
-        }
+        },
     }
 
 
