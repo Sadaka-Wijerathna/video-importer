@@ -6,6 +6,7 @@
 import os
 import asyncio
 import subprocess
+import random
 import httpx
 from hydrogram import Client
 import hydrogram.errors
@@ -191,7 +192,7 @@ async def scan_channel(
             "jobId": job.job_id, "adminId": job.admin_id,
             "status": "running", "progress": 0, "total": len(video_ids),
             "message": f"Scanning... {len(video_ids)} videos found",
-            "logs": job.logs[-20:],
+            "logs": job.logs[-100:],
         })
 
         # Telegram getHistory limit is 100.
@@ -411,7 +412,7 @@ async def _run_import_inner(
                 "jobId": job.job_id, "adminId": job.admin_id,
                 "status": "completed", "progress": processed, "total": total,
                 "message": job.message,
-                "logs": job.logs[-20:],
+                "logs": job.logs[-100:],
             })
             return
 
@@ -420,52 +421,84 @@ async def _run_import_inner(
             "jobId": job.job_id, "adminId": job.admin_id,
             "status": "running", "progress": 0, "total": total,
             "message": f"Starting import of {total} videos...",
-            "logs": job.logs[-20:],
+            "logs": job.logs[-100:],
         })
 
-        # ── Step 2: Concurrent import loop (2 parallel workers — fits in 1GB RAM on AWS) ──────────────
+        # ── Step 2: Concurrent download + serialized paced upload loop ──────────────
         CONCURRENCY = 2
-        semaphore = asyncio.Semaphore(CONCURRENCY)
-        progress_lock = asyncio.Lock()
+        download_semaphore = asyncio.Semaphore(CONCURRENCY)
+        upload_lock = asyncio.Lock()
+        checkpoint_lock = asyncio.Lock()
 
         # processed is initialized above
         videos_since_cooldown = 0
         latest_checkpoint_msg_id: int | None = None
         flood_wait_count = 0          # total FloodWait exceptions hit this session
         flood_wait_total_seconds = 0  # cumulative seconds spent waiting on FloodWaits
+        channel_forwards_restricted = False
 
-        # Safe checkpoint tracking: record which indices in final_ids are done.
-        # We only advance the checkpoint past a contiguous block of completions —
-        # so if worker B finishes final_ids[1] before worker A finishes final_ids[0],
-        # the checkpoint stays at whatever it was until final_ids[0] is also done.
         completed_flags: list[bool] = [False] * num_remaining
         safe_checkpoint_ptr = -1  # highest index where ALL 0..index are complete
 
+        async def advance_checkpoint(list_idx: int) -> int | None:
+            nonlocal safe_checkpoint_ptr, latest_checkpoint_msg_id
+            async with checkpoint_lock:
+                completed_flags[list_idx] = True
+                while (
+                    safe_checkpoint_ptr + 1 < num_remaining
+                    and completed_flags[safe_checkpoint_ptr + 1]
+                ):
+                    safe_checkpoint_ptr += 1
+                if safe_checkpoint_ptr >= 0:
+                    latest_checkpoint_msg_id = final_ids[safe_checkpoint_ptr]
+            return latest_checkpoint_msg_id
+
+        async def handle_skip(list_idx: int, reason: str):
+            nonlocal processed
+            tag = f"[{initial_progress + list_idx + 1}/{total}]"
+            job.add_log(f"{tag} {reason}")
+            chk = await advance_checkpoint(list_idx)
+            async with checkpoint_lock:
+                processed += 1
+                job.progress = processed
+                cur_processed = processed
+            await notify_buddystore(webhook_url, {
+                "jobId": job.job_id, "adminId": job.admin_id,
+                "status": "running",
+                "progress": cur_processed, "total": total,
+                "message": f"Processing {cur_processed}/{total} videos...",
+                "logs": job.logs[-100:],
+                "checkpointMsgId": chk,
+            })
+
         async def process_video(list_idx: int, msg_id: int) -> None:
-            nonlocal processed, videos_since_cooldown, latest_checkpoint_msg_id, safe_checkpoint_ptr, flood_wait_count, flood_wait_total_seconds
+            nonlocal processed, videos_since_cooldown, latest_checkpoint_msg_id, flood_wait_count, flood_wait_total_seconds, channel_forwards_restricted
 
-            async with semaphore:
-                if job.stop_flag:
-                    return
+            if job.stop_flag:
+                return
 
-                tag = f"[{initial_progress + list_idx + 1}/{total}]"
-                success = False
-                attempts = 0
-                max_attempts = 5
-                backoff_schedule = [5, 15, 30, 60, 120]
+            tag = f"[{initial_progress + list_idx + 1}/{total}]"
+            success = False
+            attempts = 0
+            max_attempts = 5
+            backoff_schedule = [5, 15, 30, 60, 120]
 
-                while not success and attempts < max_attempts and not job.stop_flag:
-                    attempts += 1
-                    tmp_file: str | None = None
-                    thumb_file: str | None = None
+            while not success and attempts < max_attempts and not job.stop_flag:
+                attempts += 1
+                tmp_file: str | None = None
+                thumb_file: str | None = None
 
-                    try:
-                        # Fresh message fetch on every attempt → fresh file reference
+                try:
+                    # ── Phase 1: Download & prepare media (Parallel between workers) ──
+                    async with download_semaphore:
+                        if job.stop_flag:
+                            return
+
                         msg = await tg.get_messages(src_peer, msg_id)
                         if not msg or (not msg.video and not msg.document):
-                            job.add_log(f"{tag} Skipped — not a video")
+                            await handle_skip(list_idx, "Skipped — not a video")
                             success = True
-                            break
+                            return
 
                         media = msg.video or msg.document
                         unique_id: str | None = getattr(media, "file_unique_id", None)
@@ -475,216 +508,242 @@ async def _run_import_inner(
                         height: int = getattr(media, "height", 0) or 0
                         caption: str = msg.caption or ""
 
-                        # ── Duplicate check ───────────────────────────────────────
                         if skip_existing and target_bot_db_id:
                             dup = await is_duplicate(
                                 duplicate_check_url, target_bot_db_id,
                                 unique_id, file_size, duration
                             )
                             if dup:
-                                job.add_log(f"{tag} Skipped — duplicate already in DB")
+                                await handle_skip(list_idx, "Skipped — duplicate already in DB")
                                 success = True
-                                break
+                                return
 
-                        # ── Fast forward (works for non-restricted channels) ───────
-                        try:
-                            await tg.forward_messages(tgt_peer, src_peer, msg_id)
-                            file_size_mb = file_size / (1024 * 1024)
-                            job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB) — forwarded")
-                            success = True
-                            break
-                        except Exception as fwd_err:
-                            fwd_msg = str(fwd_err)
-                            if "CHAT_FORWARDS_RESTRICTED" in fwd_msg or \
-                               "you can't forward" in fwd_msg.lower() or \
-                               "forbidden" in fwd_msg.lower():
-                                pass  # expected — fall through to download+upload
-                            else:
-                                raise  # re-raise unexpected errors
-
-                        # ── Download to disk ───────────────────────────────────────
                         file_size_mb = file_size / (1024 * 1024)
-                        job.message = f"{tag} Downloading ({file_size_mb:.1f} MB)..."
-                        tmp_prefix = os.path.join(
-                            DOWNLOADS_DIR, f"{job.admin_id}_{msg_id}"
-                        )
-                        tmp_file = f"{tmp_prefix}.tmp"
 
-                        # Hydrogram streams directly to disk — no full-RAM buffering
-                        await tg.download_media(msg, file_name=tmp_file)
+                        # Check if fast-forward is possible (only if channel allows it)
+                        can_try_forward = not channel_forwards_restricted
+                        if not can_try_forward:
+                            # Stream chunked to disk
+                            job.message = f"{tag} Downloading ({file_size_mb:.1f} MB)..."
+                            tmp_prefix = os.path.join(DOWNLOADS_DIR, f"{job.admin_id}_{msg_id}")
+                            tmp_file = f"{tmp_prefix}.tmp"
+                            await tg.download_media(msg, file_name=tmp_file)
 
-                        # ── Thumbnail ─────────────────────────────────────────────
-                        raw_doc = getattr(media, "_raw", None) or getattr(msg, "_raw", None)
-                        if raw_doc and hasattr(raw_doc, "thumbs"):
-                            thumb_file = await download_thumbnail(tg, raw_doc, tmp_prefix)
+                            raw_doc = getattr(media, "_raw", None) or getattr(msg, "_raw", None)
+                            if raw_doc and hasattr(raw_doc, "thumbs"):
+                                thumb_file = await download_thumbnail(tg, raw_doc, tmp_prefix)
+                            if not thumb_file and tmp_file and os.path.exists(tmp_file):
+                                thumb_file = generate_thumbnail_ffmpeg(tmp_file, f"{tmp_prefix}_thumb.jpg")
 
-                        # Fallback: generate thumbnail from the video itself via ffmpeg
-                        if not thumb_file and tmp_file and os.path.exists(tmp_file):
-                            thumb_file = generate_thumbnail_ffmpeg(
-                                tmp_file, f"{tmp_prefix}_thumb.jpg"
+                    # ── Phase 2: Upload to Telegram (Strictly serialized & paced) ──
+                    async with upload_lock:
+                        if job.stop_flag:
+                            return
+
+                        forward_done = False
+                        if can_try_forward:
+                            try:
+                                await tg.forward_messages(tgt_peer, src_peer, msg_id)
+                                job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB) — forwarded")
+                                forward_done = True
+                                success = True
+                            except Exception as fwd_err:
+                                fwd_msg = str(fwd_err)
+                                if "CHAT_FORWARDS_RESTRICTED" in fwd_msg or "you can't forward" in fwd_msg.lower() or "forbidden" in fwd_msg.lower():
+                                    channel_forwards_restricted = True
+                                else:
+                                    raise
+
+                        # If forward was not possible or channel was restricted, upload from disk
+                        if not forward_done:
+                            if not tmp_file or not os.path.exists(tmp_file):
+                                job.message = f"{tag} Downloading ({file_size_mb:.1f} MB)..."
+                                tmp_prefix = os.path.join(DOWNLOADS_DIR, f"{job.admin_id}_{msg_id}")
+                                tmp_file = f"{tmp_prefix}.tmp"
+                                await tg.download_media(msg, file_name=tmp_file)
+                                raw_doc = getattr(media, "_raw", None) or getattr(msg, "_raw", None)
+                                if raw_doc and hasattr(raw_doc, "thumbs"):
+                                    thumb_file = await download_thumbnail(tg, raw_doc, tmp_prefix)
+                                if not thumb_file and tmp_file and os.path.exists(tmp_file):
+                                    thumb_file = generate_thumbnail_ffmpeg(tmp_file, f"{tmp_prefix}_thumb.jpg")
+
+                            job.message = f"{tag} Uploading ({file_size_mb:.1f} MB)..."
+                            send_kwargs: dict = dict(
+                                chat_id=tgt_peer,
+                                video=tmp_file,
+                                caption=caption,
+                                duration=duration,
+                                width=width,
+                                height=height,
+                                supports_streaming=True,
                             )
+                            if thumb_file and os.path.exists(thumb_file):
+                                send_kwargs["thumb"] = thumb_file
 
-                        # ── Upload from disk ───────────────────────────────────────
-                        job.message = f"{tag} Uploading ({file_size_mb:.1f} MB)..."
-                        send_kwargs: dict = dict(
-                            chat_id=tgt_peer,
-                            video=tmp_file,
-                            caption=caption,
-                            duration=duration,
-                            width=width,
-                            height=height,
-                            supports_streaming=True,
+                            await tg.send_video(**send_kwargs)
+                            job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB)")
+                            success = True
+
+                        # ── Post-Upload Progress, Delay & Cooldown (Inside upload_lock) ──
+                        processed += 1
+                        videos_since_cooldown += 1
+                        job.progress = processed
+                        local_processed = processed
+                        local_chk = await advance_checkpoint(list_idx)
+
+                        total_done = initial_progress + local_processed
+                        jitter = round(random.uniform(0.2, 0.7), 2)
+                        dynamic_delay = round(2.5 + jitter + min(2.0, (total_done // 100) * 0.25), 2)
+
+                        fw_suffix = (
+                            f" | ⚠️ FloodWaits: {flood_wait_count} "
+                            f"({flood_wait_total_seconds // 60}m {flood_wait_total_seconds % 60}s total)"
+                            if flood_wait_count > 0 else ""
                         )
-                        if thumb_file and os.path.exists(thumb_file):
-                            send_kwargs["thumb"] = thumb_file
 
-                        await tg.send_video(**send_kwargs)
-                        job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB)")
-                        success = True
-
-                    except FloodWait as fw:
-                        wait = fw.value + 3
-                        # ── FloodWait analytics ───────────────────────────────
-                        flood_wait_count += 1
-                        flood_wait_total_seconds += fw.value
-                        fw_mins = flood_wait_total_seconds // 60
-                        fw_secs = flood_wait_total_seconds % 60
-                        job.add_log(
-                            f"{tag} ⏳ Rate limited — waiting {wait}s... "
-                            f"(FloodWait #{flood_wait_count}, "
-                            f"{fw_mins}m {fw_secs}s total this session)"
-                        )
-                        if fw.value > 3600:
-                            job.status = "stopped"
-                            job.message = (
-                                f"Telegram rate limit: wait "
-                                f"{fw.value // 60} min. Resume later."
-                            )
+                        # Check batch cooldown every 25 videos
+                        if videos_since_cooldown >= 25 and local_processed < total:
+                            videos_since_cooldown = 0
+                            cooldown_secs = 35
                             job.add_log(
-                                f"{tag} ⏸ Rate limit too long ({fw.value // 60} min) — paused. Resume later."
+                                f"⏳ Batch cooldown — resting {cooldown_secs}s "
+                                f"({local_processed}/{total} done, delay={dynamic_delay}s per video{fw_suffix})"
                             )
+                            job.message = f"⏳ Batch cooldown — resting {cooldown_secs}s ({local_processed}/{total} done)..."
                             await notify_buddystore(webhook_url, {
                                 "jobId": job.job_id, "adminId": job.admin_id,
-                                "status": "stopped",
+                                "status": "running",
+                                "progress": local_processed, "total": total,
+                                "message": job.message,
+                                "logs": job.logs[-100:],
+                                "checkpointMsgId": local_chk,
+                                "floodWaitCount": flood_wait_count,
+                                "floodWaitTotalSeconds": flood_wait_total_seconds,
+                                "currentDelay": dynamic_delay,
+                            })
+                            await asyncio.sleep(cooldown_secs)
+                            job.add_log("▶️ Batch cooldown complete. Continuing import...")
+                        else:
+                            await notify_buddystore(webhook_url, {
+                                "jobId": job.job_id, "adminId": job.admin_id,
+                                "status": "running",
+                                "progress": local_processed, "total": total,
+                                "message": f"Imported {local_processed}/{total} videos{fw_suffix}",
+                                "logs": job.logs[-100:],
+                                "checkpointMsgId": local_chk,
+                                "floodWaitCount": flood_wait_count,
+                                "floodWaitTotalSeconds": flood_wait_total_seconds,
+                                "currentDelay": dynamic_delay,
+                            })
+                            await asyncio.sleep(dynamic_delay)
+
+                except FloodWait as fw:
+                    wait = fw.value + 3
+                    flood_wait_count += 1
+                    flood_wait_total_seconds += fw.value
+                    fw_mins = flood_wait_total_seconds // 60
+                    fw_secs = flood_wait_total_seconds % 60
+                    job.add_log(
+                        f"{tag} ⏳ Telegram rate limited — waiting {wait}s... "
+                        f"(FloodWait #{flood_wait_count}, {fw_mins}m {fw_secs}s total this session)"
+                    )
+                    if fw.value > 3600:
+                        job.status = "stopped"
+                        job.message = f"Telegram rate limit: wait {fw.value // 60} min. Resume later."
+                        job.add_log(f"{tag} ⏸ Rate limit too long ({fw.value // 60} min) — paused. Resume later.")
+                        await notify_buddystore(webhook_url, {
+                            "jobId": job.job_id, "adminId": job.admin_id,
+                            "status": "stopped",
+                            "progress": processed, "total": total,
+                            "message": job.message,
+                            "logs": job.logs[-100:],
+                            "checkpointMsgId": latest_checkpoint_msg_id,
+                            "floodWaitCount": flood_wait_count,
+                            "floodWaitTotalSeconds": flood_wait_total_seconds,
+                        })
+                        return
+
+                    # Immediate rate-limit status update to BuddyStore
+                    rem_m = wait // 60
+                    rem_s = wait % 60
+                    rem_str = f"{rem_m}m {rem_s}s" if rem_m > 0 else f"{rem_s}s"
+                    job.message = f"⏳ Telegram rate limit — resting {rem_str}. Resumes automatically."
+                    await notify_buddystore(webhook_url, {
+                        "jobId": job.job_id, "adminId": job.admin_id,
+                        "status": "running",
+                        "progress": processed, "total": total,
+                        "message": job.message,
+                        "logs": job.logs[-100:],
+                        "checkpointMsgId": latest_checkpoint_msg_id,
+                        "floodWaitCount": flood_wait_count,
+                        "floodWaitTotalSeconds": flood_wait_total_seconds,
+                    })
+
+                    # Active countdown with 15s heartbeats
+                    remaining = wait
+                    while remaining > 0 and not job.stop_flag:
+                        step = min(remaining, 5)
+                        await asyncio.sleep(step)
+                        remaining -= step
+                        if remaining > 0 and remaining % 15 == 0:
+                            cur_m = remaining // 60
+                            cur_s = remaining % 60
+                            cur_str = f"{cur_m}m {cur_s}s" if cur_m > 0 else f"{cur_s}s"
+                            job.message = f"⏳ Telegram rate limit — {cur_str} remaining. Resumes automatically."
+                            await notify_buddystore(webhook_url, {
+                                "jobId": job.job_id, "adminId": job.admin_id,
+                                "status": "running",
                                 "progress": processed, "total": total,
                                 "message": job.message,
-                                "logs": job.logs[-20:],
+                                "logs": job.logs[-100:],
                                 "checkpointMsgId": latest_checkpoint_msg_id,
                                 "floodWaitCount": flood_wait_count,
                                 "floodWaitTotalSeconds": flood_wait_total_seconds,
                             })
-                            return
-                        await asyncio.sleep(wait)
-                        # ── Smarter recovery buffer after long FloodWaits ─────
-                        # After a wait >60s the quota window is likely still active.
-                        # A short extra pause reduces the chance of immediately
-                        # re-triggering the same limit on the very next request.
-                        if fw.value > 60:
-                            recovery = min(60, fw.value // 10)  # 10% of wait, max 60s
-                            job.add_log(
-                                f"{tag} 🔄 Recovery buffer +{recovery}s after long flood wait"
-                            )
-                            await asyncio.sleep(recovery)
-                        # Don't increment attempts — flood wait is not a failure
 
-                    except Exception as e:
-                        err_msg = str(e)
-                        is_retryable = any(x in err_msg.lower() for x in [
-                            "file reference", "unexpected eof", "stream reading",
-                            "connection", "timeout", "reset", "filelocat"
-                        ])
-                        if is_retryable and attempts < max_attempts:
-                            backoff = backoff_schedule[attempts - 1]
-                            job.add_log(
-                                f"{tag} 🔄 Retry {attempts}/{max_attempts}: "
-                                f"{err_msg[:60]} — waiting {backoff}s..."
-                            )
-                            await asyncio.sleep(backoff)
-                        else:
-                            job.add_log(f"{tag} ❌ Failed — {err_msg[:100]}")
-                            success = True  # skip this video, move on
+                    # Extra recovery buffer to avoid re-triggering quota
+                    recovery = min(30, max(5, fw.value // 10))
+                    job.add_log(f"{tag} 🔄 Recovery buffer +{recovery}s to restore Telegram quota...")
+                    job.message = f"⏳ Stabilizing connection (+{recovery}s)..."
+                    await asyncio.sleep(recovery)
+                    job.add_log(f"{tag} ▶️ Rate limit lifted! Resuming import...")
+                    job.message = f"Resuming import ({processed}/{total} done)..."
+                    await notify_buddystore(webhook_url, {
+                        "jobId": job.job_id, "adminId": job.admin_id,
+                        "status": "running",
+                        "progress": processed, "total": total,
+                        "message": job.message,
+                        "logs": job.logs[-100:],
+                        "checkpointMsgId": latest_checkpoint_msg_id,
+                    })
 
-                    finally:
-                        for f in [tmp_file, thumb_file]:
-                            if f and os.path.exists(f):
-                                try:
-                                    os.unlink(f)
-                                except Exception:
-                                    pass
+                except Exception as e:
+                    err_msg = str(e)
+                    is_retryable = any(x in err_msg.lower() for x in [
+                        "file reference", "unexpected eof", "stream reading",
+                        "connection", "timeout", "reset", "filelocat"
+                    ])
+                    if is_retryable and attempts < max_attempts:
+                        backoff = backoff_schedule[attempts - 1]
+                        job.add_log(
+                            f"{tag} 🔄 Retry {attempts}/{max_attempts}: {err_msg[:60]} — waiting {backoff}s..."
+                        )
+                        await asyncio.sleep(backoff)
+                    else:
+                        job.add_log(f"{tag} ❌ Failed — {err_msg[:100]}")
+                        success = True
+                        await advance_checkpoint(list_idx)
 
-            # ── Update shared progress (guarded by lock) ──────────────────────
-            # Note: asyncio is single-threaded so the lock prevents logical races
-            # between the two coroutines at their respective await boundaries.
-            local_should_cooldown = False
-            async with progress_lock:
-                processed += 1
-                videos_since_cooldown += 1
-                job.progress = processed
+                finally:
+                    for f in [tmp_file, thumb_file]:
+                        if f and os.path.exists(f):
+                            try:
+                                os.unlink(f)
+                            except Exception:
+                                pass
 
-                # Advance safe checkpoint pointer: walk forward from the last safe
-                # position as long as the next index is also marked complete.
-                completed_flags[list_idx] = True
-                while (
-                    safe_checkpoint_ptr + 1 < num_remaining
-                    and completed_flags[safe_checkpoint_ptr + 1]
-                ):
-                    safe_checkpoint_ptr += 1
-                if safe_checkpoint_ptr >= 0:
-                    latest_checkpoint_msg_id = final_ids[safe_checkpoint_ptr]
-
-                local_processed = processed
-                local_checkpoint = latest_checkpoint_msg_id
-                local_fw_count = flood_wait_count
-                local_fw_total = flood_wait_total_seconds
-
-                # Cooldown every 20 completed videos (was 40 — halved for 2× throughput)
-                if videos_since_cooldown >= 20 and local_processed < total:
-                    videos_since_cooldown = 0
-                    local_should_cooldown = True
-
-            # ── Dynamic inter-video delay ─────────────────────────────────────
-            # Delay grows as the job progresses to avoid exhausting Telegram's
-            # per-account upload quota on large imports (1000+ videos).
-            # Formula: 0.8s base + 0.5s per 100 videos done, capped at 5s total.
-            total_done = initial_progress + local_processed
-            dynamic_delay = round(0.8 + min(4.2, (total_done // 100) * 0.5), 1)
-
-            # ── FloodWait analytics summary for webhook ────────────────────────
-            fw_suffix = (
-                f" | ⚠️ FloodWaits: {local_fw_count} "
-                f"({local_fw_total // 60}m {local_fw_total % 60}s total)"
-                if local_fw_count > 0 else ""
-            )
-
-            # Progress callback outside the lock
-            await notify_buddystore(webhook_url, {
-                "jobId": job.job_id, "adminId": job.admin_id,
-                "status": "running",
-                "progress": local_processed, "total": total,
-                "message": f"Imported {local_processed}/{total} videos{fw_suffix}",
-                "logs": job.logs[-20:],
-                "checkpointMsgId": local_checkpoint,
-                "floodWaitCount": local_fw_count,
-                "floodWaitTotalSeconds": local_fw_total,
-                "currentDelay": dynamic_delay,
-            })
-
-            if local_should_cooldown and local_processed < total:
-                fw_note = (
-                    f" | ⚠️ {local_fw_count} FloodWaits so far "
-                    f"({local_fw_total // 60}m {local_fw_total % 60}s total)"
-                    if local_fw_count > 0 else ""
-                )
-                job.add_log(
-                    f"⏳ Batch cooldown — resting 15s "
-                    f"({local_processed}/{total} done, delay={dynamic_delay}s per video{fw_note})"
-                )
-                await asyncio.sleep(15)
-            else:
-                await asyncio.sleep(dynamic_delay)
-
-        # Launch all tasks; semaphore keeps exactly CONCURRENCY running at once
-        job.add_log(f"🚀 Starting concurrent import: {total} videos, {CONCURRENCY} workers.")
+        # Launch all tasks; download_semaphore keeps download tasks bounded
+        job.add_log(f"🚀 Starting paced concurrent import: {total} videos, {CONCURRENCY} workers.")
         await asyncio.gather(
             *[process_video(i, mid) for i, mid in enumerate(final_ids)],
             return_exceptions=True,
@@ -700,7 +759,7 @@ async def _run_import_inner(
             "status": job.status,
             "progress": processed, "total": total,
             "message": job.message,
-            "logs": job.logs[-50:],
+            "logs": job.logs[-200:],
             "checkpointMsgId": latest_checkpoint_msg_id,
         })
 
@@ -740,5 +799,5 @@ async def run_import(
             "jobId": job.job_id, "adminId": job.admin_id,
             "status": "failed", "progress": initial_progress, "total": original_total,
             "message": job.message,
-            "logs": job.logs[-50:],
+            "logs": job.logs[-200:],
         })

@@ -21,8 +21,8 @@ class ImportJob:
         timestamp = datetime.utcnow().strftime("%H:%M:%S")
         entry = f"[{timestamp}] {msg}"
         self.logs.append(entry)
-        if len(self.logs) > 500:
-            self.logs = self.logs[-500:]
+        if len(self.logs) > 1000:
+            self.logs = self.logs[-1000:]
         print(entry, flush=True)
 
 
