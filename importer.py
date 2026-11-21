@@ -395,10 +395,13 @@ async def _run_import_inner(
             job.add_log(f"Capped to {limit_count} videos (limitCount).")
 
         num_remaining = len(final_ids)
-        if original_total > 0:
+        if original_total > 0 and initial_progress > 0 and msg_ids:
+            # Only use checkpoint offset if pre-supplied msg_ids (no fresh scan).
+            # A fresh scan always resets processed to 0 to avoid overcounting.
             total = original_total
             processed = initial_progress
         else:
+            # Fresh scan — always start from 0
             total = num_remaining
             processed = 0
 
