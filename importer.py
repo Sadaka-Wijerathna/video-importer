@@ -1,9 +1,12 @@
 # importer.py — Full Hydrogram import loop
 # Features: channel scan, startMsgId/endMsgId range, skipExisting watermark,
 #           limitCount, duplicate check, thumbnail upload, flood wait,
-#           EOF retry, batch cooldown, webhook progress callbacks.
+#           EOF retry, batch cooldown, webhook progress callbacks,
+#           scan result cache, bounded task queue, adaptive concurrency/cooldown.
 
 import os
+import json
+import time
 import asyncio
 import subprocess
 import random
@@ -30,6 +33,39 @@ DOWNLOADS_DIR = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads"),
 )
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+SCAN_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_cache")
+os.makedirs(SCAN_CACHE_DIR, exist_ok=True)
+SCAN_CACHE_TTL = 3600  # seconds — cache is valid for 1 hour
+
+
+def _scan_cache_key(source_chat: str | int, start_id: int | None, end_id: int | None) -> str:
+    return f"{source_chat}_{start_id or 0}_{end_id or 0}"
+
+
+def _load_scan_cache(key: str) -> list[int] | None:
+    path = os.path.join(SCAN_CACHE_DIR, f"{key}.json")
+    try:
+        if not os.path.exists(path):
+            return None
+        age = time.time() - os.path.getmtime(path)
+        if age > SCAN_CACHE_TTL:
+            os.unlink(path)
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        return data.get("ids") if isinstance(data.get("ids"), list) else None
+    except Exception:
+        return None
+
+
+def _save_scan_cache(key: str, ids: list[int]) -> None:
+    path = os.path.join(SCAN_CACHE_DIR, f"{key}.json")
+    try:
+        with open(path, "w") as f:
+            json.dump({"ids": ids, "saved_at": time.time()}, f)
+    except Exception as e:
+        print(f"[scan_cache] Failed to save: {e}", flush=True)
 
 
 # ── Webhook helper ─────────────────────────────────────────────────────────────
@@ -94,9 +130,21 @@ async def scan_channel(
       • offset_id = end_message_id + 1  (ceiling, 0 = newest)
       • floor_id  = max(last_msg_id, start_message_id - 1)  (floor)
       • Telegram API returns up to 100 messages per getHistory call.
+      • Results are cached to disk for 1 hour to speed up auto-resume rescans.
     """
     job.add_log("Scanning channel for videos...")
     job.message = "Scanning..."
+
+    # ── Scan cache (only for full-range scans, not checkpoint scans) ─────────
+    # A checkpoint scan uses last_msg_id as floor → different result set each time.
+    # Only cache when last_msg_id is None (first ever run for this range).
+    cache_key = _scan_cache_key(source_chat, start_message_id, end_message_id)
+    if not last_msg_id:
+        cached = _load_scan_cache(cache_key)
+        if cached is not None:
+            job.add_log(f"✅ Scan cache hit — {len(cached)} videos loaded from cache (< 1h old).")
+            return cached
+    # ─────────────────────────────────────────────────────────────────────────
 
     video_ids: list[int] = []
     offset_id = (end_message_id + 1) if end_message_id else 0
@@ -207,6 +255,10 @@ async def scan_channel(
     # Return in chronological order (oldest first, like original)
     video_ids.reverse()
     job.add_log(f"Scan complete: {len(video_ids)} videos found.")
+    # Save to cache only for full-range scans (no checkpoint floor)
+    if not last_msg_id and video_ids:
+        _save_scan_cache(cache_key, video_ids)
+        job.add_log(f"💾 Scan result cached ({len(video_ids)} IDs) — fast resume available for 1h.")
     return video_ids
 
 
@@ -351,10 +403,24 @@ async def _run_import_inner(
         # With limit=5 only the 5 most recent chats were loaded, causing
         # PEER_ID_INVALID for any channel not in that tiny window.
         job.add_log("🔄 Loading Telegram dialogs...")
+        job.message = "🔄 Loading Telegram session dialogs (~30s)..."
+        await notify_buddystore(webhook_url, {
+            "jobId": job.job_id, "adminId": job.admin_id,
+            "status": "running", "progress": 0, "total": 0,
+            "message": job.message, "logs": job.logs[-100:],
+        })
         try:
             dialog_count = 0
             async for _ in tg.get_dialogs(limit=500):
                 dialog_count += 1
+                # Webhook every 50 dialogs so the UI shows live progress
+                if dialog_count % 50 == 0:
+                    job.message = f"🔄 Loading dialogs... {dialog_count}/500"
+                    await notify_buddystore(webhook_url, {
+                        "jobId": job.job_id, "adminId": job.admin_id,
+                        "status": "running", "progress": 0, "total": 0,
+                        "message": job.message, "logs": job.logs[-100:],
+                    })
             job.add_log(f"✅ Loaded {dialog_count} dialogs")
         except Exception as e:
             job.add_log(f"⚠️ Dialog load partial: {e}")
@@ -435,8 +501,12 @@ async def _run_import_inner(
         })
 
         # ── Step 2: Concurrent download + serialized paced upload loop ──────────────
-        CONCURRENCY = 2
-        download_semaphore = asyncio.Semaphore(CONCURRENCY)
+        # CONCURRENCY is dynamic — starts at 2, drops to 1 if FloodWaits spike.
+        # We use a bounded task queue instead of asyncio.gather(*all_tasks) to avoid
+        # creating 1000+ coroutines in memory at once on large channels.
+        BASE_CONCURRENCY = 2
+        current_concurrency = BASE_CONCURRENCY
+        download_semaphore = asyncio.Semaphore(current_concurrency)
         upload_lock = asyncio.Lock()
         checkpoint_lock = asyncio.Lock()
 
@@ -446,6 +516,11 @@ async def _run_import_inner(
         flood_wait_count = 0          # total FloodWait exceptions hit this session
         flood_wait_total_seconds = 0  # cumulative seconds spent waiting on FloodWaits
         channel_forwards_restricted = False
+
+        # ── Dynamic concurrency: drop to 1 worker if FloodWaits spike ────────
+        # Tracks whether semaphore was last set to 1 or 2 to avoid rebuilding it
+        # unnecessarily. Semaphore cannot be resized — we replace it on threshold.
+        _concurrency_reduced = False
 
         completed_flags: list[bool] = [False] * num_remaining
         safe_checkpoint_ptr = -1  # highest index where ALL 0..index are complete
@@ -611,10 +686,19 @@ async def _run_import_inner(
                             if flood_wait_count > 0 else ""
                         )
 
-                        # Check batch cooldown every 25 videos
-                        if videos_since_cooldown >= 25 and local_processed < total:
-                            videos_since_cooldown = 0
+                        # ── Adaptive batch cooldown (#6) ───────────────────────────────────
+                        # Base: every 25 videos / 35s. If FloodWaits > 10 this session,
+                        # tighten to every 15 videos / 60s to give Telegram more breathing room.
+                        if flood_wait_count > 10:
+                            cooldown_every = 15
+                            cooldown_secs = 60
+                        else:
+                            cooldown_every = 25
                             cooldown_secs = 35
+
+                        # Check batch cooldown
+                        if videos_since_cooldown >= cooldown_every and local_processed < total:
+                            videos_since_cooldown = 0
                             job.add_log(
                                 f"⏳ Batch cooldown — resting {cooldown_secs}s "
                                 f"({local_processed}/{total} done, delay={dynamic_delay}s per video{fw_suffix})"
@@ -657,6 +741,17 @@ async def _run_import_inner(
                         f"{tag} ⏳ Telegram rate limited — waiting {wait}s... "
                         f"(FloodWait #{flood_wait_count}, {fw_mins}m {fw_secs}s total this session)"
                     )
+
+                    # ── Dynamic concurrency reduction (#5) ────────────────────────
+                    # After 10 FloodWaits, drop to 1 concurrent download to relieve
+                    # API pressure. Rebuild the semaphore with the new limit.
+                    if flood_wait_count >= 10 and not _concurrency_reduced:
+                        _concurrency_reduced = True
+                        download_semaphore = asyncio.Semaphore(1)
+                        job.add_log(
+                            f"⚠️ High FloodWait rate ({flood_wait_count} hits) — "
+                            f"reducing concurrency to 1 worker to relieve Telegram pressure."
+                        )
                     if fw.value > 3600:
                         job.status = "stopped"
                         job.message = f"Telegram rate limit: wait {fw.value // 60} min. Resume later."
@@ -752,10 +847,27 @@ async def _run_import_inner(
                             except Exception:
                                 pass
 
-        # Launch all tasks; download_semaphore keeps download tasks bounded
-        job.add_log(f"🚀 Starting paced concurrent import: {total} videos, {CONCURRENCY} workers.")
+        # ── Bounded task queue (#3) — avoids creating 1000+ coroutines at once ──
+        # Instead of asyncio.gather(*all_tasks), feed a queue and run N workers.
+        # Workers pull tasks one-at-a-time, so only BASE_CONCURRENCY tasks are
+        # live in memory at any moment regardless of how large the channel is.
+        job.add_log(f"🚀 Starting bounded import queue: {total} videos, {BASE_CONCURRENCY} workers.")
+
+        task_queue: asyncio.Queue = asyncio.Queue()
+        for i, mid in enumerate(final_ids):
+            await task_queue.put((i, mid))
+
+        async def queue_worker():
+            while not task_queue.empty() and not job.stop_flag:
+                try:
+                    i, mid = task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await process_video(i, mid)
+                task_queue.task_done()
+
         await asyncio.gather(
-            *[process_video(i, mid) for i, mid in enumerate(final_ids)],
+            *[queue_worker() for _ in range(BASE_CONCURRENCY)],
             return_exceptions=True,
         )
 

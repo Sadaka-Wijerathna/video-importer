@@ -71,7 +71,7 @@ _prom_net_tx = Gauge(
 # In-memory network speed delta tracker
 _last_net_sample = None  # (timestamp, rx_bytes, tx_bytes)
 
-from jobs import get_job, create_job, remove_job, get_all_jobs
+from jobs import get_job, create_job, remove_job, get_all_jobs, get_running_job
 from importer import run_import
 
 API_SECRET = os.getenv("IMPORTER_API_SECRET") or ""  # shared secret with BuddyStore backend
@@ -411,21 +411,24 @@ async def system_stats():
 async def start_job(req: StartJobRequest, x_api_secret: str = Header(default="")):
     verify_secret(x_api_secret)
 
-    existing = get_job(req.admin_id)
+    # Check for a running job on the EXACT same pipeline (admin + source + target)
+    existing = get_running_job(req.admin_id, req.source_chat, req.target_chat)
     if existing and existing.status == "running":
         # Allow re-sending the exact same job (resume after crash / auto-resume).
-        # If job_db_id matches the in-memory job, stop the old one gracefully and restart.
         if req.job_db_id and existing.job_id == req.job_db_id:
             print(f"[start-job] Re-starting same job {req.job_db_id} — stopping old task first.", flush=True)
             existing.stop_flag = True
             existing.status = "stopped"
-            # Small yield so any running coroutine can notice stop_flag
             await asyncio.sleep(0.1)
         else:
-            raise HTTPException(status_code=409, detail="Import already running for this admin.")
+            raise HTTPException(
+                status_code=409,
+                detail=f"Import already running for {req.source_chat} → {req.target_chat}. "
+                       f"Different source/target pairs can run in parallel."
+            )
 
     job_id = req.job_db_id or str(uuid.uuid4())
-    job = create_job(job_id, req.admin_id)
+    job = create_job(job_id, req.admin_id, source_chat=req.source_chat, target_bot=req.target_chat)
     if req.initial_logs:
         job.logs = req.initial_logs.copy()
 
