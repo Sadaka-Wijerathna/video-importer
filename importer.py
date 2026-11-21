@@ -401,9 +401,13 @@ async def _run_import_inner(
             total = original_total
             processed = initial_progress
         else:
-            # Fresh scan — always start from 0
+            # Fresh scan (or resume with empty msg_ids) — always start from 0.
+            # IMPORTANT: also reset initial_progress to 0 so the tag formula
+            # [initial_progress + list_idx + 1 / total] doesn't overcounts on
+            # auto-resume where initial_progress is set but msg_ids is empty.
             total = num_remaining
             processed = 0
+            initial_progress = 0  # ← fix: reset so tag formula stays [1/N]..[N/N]
 
         job.total = total
 
