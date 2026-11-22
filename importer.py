@@ -557,7 +557,7 @@ async def _run_import_inner(
             })
 
         async def process_video(list_idx: int, msg_id: int) -> None:
-            nonlocal processed, videos_since_cooldown, latest_checkpoint_msg_id, flood_wait_count, flood_wait_total_seconds, channel_forwards_restricted
+            nonlocal processed, videos_since_cooldown, latest_checkpoint_msg_id, flood_wait_count, flood_wait_total_seconds, channel_forwards_restricted, download_semaphore, _concurrency_reduced
 
             if job.stop_flag:
                 return
