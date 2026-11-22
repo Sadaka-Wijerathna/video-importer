@@ -1,8 +1,10 @@
 # importer.py — Full Hydrogram import loop
 # Features: channel scan, startMsgId/endMsgId range, skipExisting watermark,
 #           limitCount, duplicate check, thumbnail upload, flood wait,
-#           EOF retry, batch cooldown, webhook progress callbacks,
-#           scan result cache, bounded task queue, adaptive concurrency/cooldown.
+#           EOF retry, token-bucket rate limiter, webhook progress callbacks,
+#           scan result cache, bounded task queue, adaptive concurrency,
+#           drop_author server-side copy, Premium detection, DC logging,
+#           local checkpoint persistence.
 
 import os
 import json
@@ -37,6 +39,84 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 SCAN_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_cache")
 os.makedirs(SCAN_CACHE_DIR, exist_ok=True)
 SCAN_CACHE_TTL = 3600  # seconds — cache is valid for 1 hour
+
+CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+DC_NAMES = {1: "DC1 (Miami)", 2: "DC2 (Amsterdam)", 4: "DC4 (Amsterdam)", 5: "DC5 (Singapore)"}
+
+
+# ── Token Bucket Rate Limiter ─────────────────────────────────────────────────
+# Replaces fixed per-video delay with an adaptive system:
+#   • Premium sessions: larger bucket (240 tokens, 4 tokens/s refill = 26× quota)
+#   • Free sessions:    normal bucket (60 tokens,  1 token/s refill)
+#   • Cost per video:   size-aware — larger files drain more tokens
+#   • FloodWait penalty: drains the bucket proportionally
+#   • When bucket is full → near-zero delay; when empty → natural backpressure
+
+class TokenBucket:
+    def __init__(self, capacity: float, refill_rate: float):
+        self.capacity = capacity
+        self.tokens = capacity
+        self.refill_rate = refill_rate  # tokens per second
+        self.last_refill = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def consume(self, amount: float = 1.0) -> float:
+        """Returns seconds to wait (0.0 if bucket had enough tokens)."""
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self.last_refill
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
+            self.last_refill = now
+            if self.tokens >= amount:
+                self.tokens -= amount
+                return 0.0
+            wait = (amount - self.tokens) / self.refill_rate
+            self.tokens = 0.0
+            return wait
+
+    async def penalize(self, seconds: float) -> None:
+        """Drain bucket after a FloodWait — back-pressure proportional to wait time."""
+        async with self._lock:
+            drain = seconds * self.refill_rate * 0.5  # drain 50% of FloodWait equivalent
+            self.tokens = max(0.0, self.tokens - drain)
+
+    @property
+    def level_pct(self) -> float:
+        return round((self.tokens / self.capacity) * 100, 1)
+
+
+def _token_cost(file_size_mb: float) -> float:
+    """Size-aware token cost so large files naturally pace themselves."""
+    if file_size_mb <= 5:
+        return 1.0
+    elif file_size_mb <= 50:
+        return 1.0 + file_size_mb / 25.0
+    else:
+        return 3.0 + file_size_mb / 50.0
+
+
+# ── Local checkpoint persistence ──────────────────────────────────────────────
+# Saves checkpoint every 10 videos to disk so a PM2 restart can be fast-resumed
+# without hitting the backend webhook (which may be temporarily unreachable).
+
+def _save_local_checkpoint(job_id: str, msg_id: int, processed: int, total: int) -> None:
+    path = os.path.join(CHECKPOINT_DIR, f"{job_id}.json")
+    try:
+        with open(path, "w") as f:
+            json.dump({"msg_id": msg_id, "processed": processed, "total": total, "ts": time.time()}, f)
+    except Exception as e:
+        print(f"[checkpoint] Save failed: {e}", flush=True)
+
+
+def _clear_local_checkpoint(job_id: str) -> None:
+    path = os.path.join(CHECKPOINT_DIR, f"{job_id}.json")
+    try:
+        if os.path.exists(path):
+            os.unlink(path)
+    except Exception:
+        pass
 
 
 def _scan_cache_key(source_chat: str | int, start_id: int | None, end_id: int | None) -> str:
@@ -402,12 +482,29 @@ async def _run_import_inner(
         # user has already joined, loading dialogs populates this cache.
         # With limit=5 only the 5 most recent chats were loaded, causing
         # PEER_ID_INVALID for any channel not in that tiny window.
+        # ── Premium detection ──────────────────────────────────────────────────
+        # Check if the session account has Telegram Premium.
+        # Premium gives 26× upload quota (4GB/min vs 150MB/min), dramatically
+        # reducing FloodWaits. We tune concurrency and token bucket accordingly.
+        is_premium = False
+        try:
+            me = await tg.get_me()
+            is_premium = bool(getattr(me, "is_premium", False))
+            if is_premium:
+                job.add_log("⚡ PREMIUM SESSION DETECTED — running at full speed! (26× upload quota)")
+                job.message = "⚡ Premium session — maximum throughput mode"
+            else:
+                job.add_log("ℹ️ Free session — rate limits apply. Consider Telegram Premium for 26× speed.")
+        except Exception as e:
+            job.add_log(f"⚠️ Could not detect Premium status: {e}")
+
         job.add_log("🔄 Loading Telegram dialogs...")
         job.message = "🔄 Loading Telegram session dialogs (~30s)..."
         await notify_buddystore(webhook_url, {
             "jobId": job.job_id, "adminId": job.admin_id,
             "status": "running", "progress": 0, "total": 0,
             "message": job.message, "logs": job.logs[-100:],
+            "isPremium": is_premium,
         })
         try:
             dialog_count = 0
@@ -420,6 +517,7 @@ async def _run_import_inner(
                         "jobId": job.job_id, "adminId": job.admin_id,
                         "status": "running", "progress": 0, "total": 0,
                         "message": job.message, "logs": job.logs[-100:],
+                        "isPremium": is_premium,
                     })
             job.add_log(f"✅ Loaded {dialog_count} dialogs")
         except Exception as e:
@@ -498,28 +596,41 @@ async def _run_import_inner(
             "status": "running", "progress": 0, "total": total,
             "message": f"Starting import of {total} videos...",
             "logs": job.logs[-100:],
+            "isPremium": is_premium,
         })
 
         # ── Step 2: Concurrent download + serialized paced upload loop ──────────────
-        # CONCURRENCY is dynamic — starts at 2, drops to 1 if FloodWaits spike.
-        # We use a bounded task queue instead of asyncio.gather(*all_tasks) to avoid
-        # creating 1000+ coroutines in memory at once on large channels.
-        BASE_CONCURRENCY = 2
-        current_concurrency = BASE_CONCURRENCY
-        download_semaphore = asyncio.Semaphore(current_concurrency)
+        # CONCURRENCY is dynamic:
+        #   • Premium: 4 workers (26× quota), free: 2 workers
+        #   • Drops to 1 worker after 10 FloodWaits regardless of session type
+        # Token Bucket replaces fixed delays — adapts in real-time to quota state.
+        BASE_CONCURRENCY = 4 if is_premium else 2
+        download_semaphore = asyncio.Semaphore(BASE_CONCURRENCY)
         upload_lock = asyncio.Lock()
         checkpoint_lock = asyncio.Lock()
 
+        # Token Bucket: Premium = 4GB/min quota (~26× free), Free = 150MB/min
+        # capacity=60/240 represents ~1 min of budget; refill_rate = tokens/second
+        bucket = TokenBucket(
+            capacity=240.0 if is_premium else 60.0,
+            refill_rate=4.0 if is_premium else 1.0,
+        )
+        if is_premium:
+            job.add_log("⚡ Token bucket: Premium mode (240 cap, 4.0/s refill)")
+        else:
+            job.add_log("ℹ️ Token bucket: Free mode (60 cap, 1.0/s refill)")
+
+        # Checkpoint saved locally every 10 successful videos (crash resilience)
+        _local_checkpoint_counter = 0
+
         # processed is initialized above
-        videos_since_cooldown = 0
         latest_checkpoint_msg_id: int | None = None
         flood_wait_count = 0          # total FloodWait exceptions hit this session
         flood_wait_total_seconds = 0  # cumulative seconds spent waiting on FloodWaits
         channel_forwards_restricted = False
+        source_dc_id: int | None = None  # detected DC of source channel files
 
         # ── Dynamic concurrency: drop to 1 worker if FloodWaits spike ────────
-        # Tracks whether semaphore was last set to 1 or 2 to avoid rebuilding it
-        # unnecessarily. Semaphore cannot be resized — we replace it on threshold.
         _concurrency_reduced = False
 
         completed_flags: list[bool] = [False] * num_remaining
@@ -557,7 +668,7 @@ async def _run_import_inner(
             })
 
         async def process_video(list_idx: int, msg_id: int) -> None:
-            nonlocal processed, videos_since_cooldown, latest_checkpoint_msg_id, flood_wait_count, flood_wait_total_seconds, channel_forwards_restricted, download_semaphore, _concurrency_reduced
+            nonlocal processed, latest_checkpoint_msg_id, flood_wait_count, flood_wait_total_seconds, channel_forwards_restricted, download_semaphore, _concurrency_reduced, source_dc_id, _local_checkpoint_counter
 
             if job.stop_flag:
                 return
@@ -593,6 +704,13 @@ async def _run_import_inner(
                         height: int = getattr(media, "height", 0) or 0
                         caption: str = msg.caption or ""
 
+                        # ── DC-aware routing logging ───────────────────────────────
+                        raw_doc = getattr(media, "_raw", None) or getattr(msg, "_raw", None)
+                        if raw_doc and hasattr(raw_doc, "dc_id") and source_dc_id is None:
+                            source_dc_id = raw_doc.dc_id
+                            dc_name = DC_NAMES.get(source_dc_id, f"DC{source_dc_id}")
+                            job.add_log(f"📡 Source files are on {dc_name} (detected from first video)")
+
                         if skip_existing and target_bot_db_id:
                             dup = await is_duplicate(
                                 duplicate_check_url, target_bot_db_id,
@@ -614,7 +732,6 @@ async def _run_import_inner(
                             tmp_file = f"{tmp_prefix}.tmp"
                             await tg.download_media(msg, file_name=tmp_file)
 
-                            raw_doc = getattr(media, "_raw", None) or getattr(msg, "_raw", None)
                             if raw_doc and hasattr(raw_doc, "thumbs"):
                                 thumb_file = await download_thumbnail(tg, raw_doc, tmp_prefix)
                             if not thumb_file and tmp_file and os.path.exists(tmp_file):
@@ -628,14 +745,34 @@ async def _run_import_inner(
                         forward_done = False
                         if can_try_forward:
                             try:
-                                await tg.forward_messages(tgt_peer, src_peer, msg_id)
-                                job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB) — forwarded")
+                                # ── drop_author=True: server-side copy, no "Forwarded from" label ──
+                                # Uses raw MTProto ForwardMessages with drop_author=True, which is
+                                # equivalent to Bot API copyMessage — no bandwidth used, <1s per video.
+                                await tg.invoke(
+                                    functions.messages.ForwardMessages(
+                                        from_peer=await tg.resolve_peer(src_peer),
+                                        to_peer=await tg.resolve_peer(tgt_peer),
+                                        id=[msg_id],
+                                        random_id=[random.randint(0, 2**63)],
+                                        drop_author=True,          # no "Forwarded from X" banner
+                                        drop_media_captions=False,
+                                        with_my_score=False,
+                                        grouped=False,
+                                        background=False,
+                                        silent=False,
+                                        noforwards=False,
+                                        schedule_date=None,
+                                        send_as=None,
+                                    )
+                                )
+                                job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB) — server-side copy")
                                 forward_done = True
                                 success = True
                             except Exception as fwd_err:
                                 fwd_msg = str(fwd_err)
                                 if "CHAT_FORWARDS_RESTRICTED" in fwd_msg or "you can't forward" in fwd_msg.lower() or "forbidden" in fwd_msg.lower():
                                     channel_forwards_restricted = True
+                                    job.add_log(f"{tag} 🔒 Channel restricts forwarding — switching to download+reupload mode")
                                 else:
                                     raise
 
@@ -646,9 +783,9 @@ async def _run_import_inner(
                                 tmp_prefix = os.path.join(DOWNLOADS_DIR, f"{job.admin_id}_{msg_id}")
                                 tmp_file = f"{tmp_prefix}.tmp"
                                 await tg.download_media(msg, file_name=tmp_file)
-                                raw_doc = getattr(media, "_raw", None) or getattr(msg, "_raw", None)
-                                if raw_doc and hasattr(raw_doc, "thumbs"):
-                                    thumb_file = await download_thumbnail(tg, raw_doc, tmp_prefix)
+                                raw_doc2 = getattr(media, "_raw", None) or getattr(msg, "_raw", None)
+                                if raw_doc2 and hasattr(raw_doc2, "thumbs"):
+                                    thumb_file = await download_thumbnail(tg, raw_doc2, tmp_prefix)
                                 if not thumb_file and tmp_file and os.path.exists(tmp_file):
                                     thumb_file = generate_thumbnail_ffmpeg(tmp_file, f"{tmp_prefix}_thumb.jpg")
 
@@ -669,16 +806,16 @@ async def _run_import_inner(
                             job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB)")
                             success = True
 
-                        # ── Post-Upload Progress, Delay & Cooldown (Inside upload_lock) ──
+                        # ── Post-Upload: Token Bucket pacing + checkpoint + webhook ──
                         processed += 1
-                        videos_since_cooldown += 1
                         job.progress = processed
                         local_processed = processed
                         local_chk = await advance_checkpoint(list_idx)
 
-                        total_done = initial_progress + local_processed
-                        jitter = round(random.uniform(0.2, 0.7), 2)
-                        dynamic_delay = round(2.5 + jitter + min(2.0, (total_done // 100) * 0.25), 2)
+                        # Local checkpoint every 10 successful videos (crash resilience)
+                        _local_checkpoint_counter += 1
+                        if _local_checkpoint_counter % 10 == 0 and local_chk:
+                            _save_local_checkpoint(job.job_id, local_chk, local_processed, total)
 
                         fw_suffix = (
                             f" | ⚠️ FloodWaits: {flood_wait_count} "
@@ -686,50 +823,35 @@ async def _run_import_inner(
                             if flood_wait_count > 0 else ""
                         )
 
-                        # ── Adaptive batch cooldown (#6) ───────────────────────────────────
-                        # Base: every 25 videos / 35s. If FloodWaits > 10 this session,
-                        # tighten to every 15 videos / 60s to give Telegram more breathing room.
-                        if flood_wait_count > 10:
-                            cooldown_every = 15
-                            cooldown_secs = 60
-                        else:
-                            cooldown_every = 25
-                            cooldown_secs = 35
+                        dc_suffix = f" | 📡 {DC_NAMES.get(source_dc_id, f'DC{source_dc_id}')}" if source_dc_id else ""
+                        premium_flag = " | ⚡ Premium" if is_premium else ""
 
-                        # Check batch cooldown
-                        if videos_since_cooldown >= cooldown_every and local_processed < total:
-                            videos_since_cooldown = 0
+                        # ── Token Bucket delay ────────────────────────────────────────
+                        # Consume tokens proportional to file size; wait if bucket is low.
+                        # This replaces fixed delays and batch cooldowns with adaptive pacing.
+                        token_cost = _token_cost(file_size_mb)
+                        bucket_wait = await bucket.consume(token_cost)
+                        if bucket_wait > 0:
                             job.add_log(
-                                f"⏳ Batch cooldown — resting {cooldown_secs}s "
-                                f"({local_processed}/{total} done, delay={dynamic_delay}s per video{fw_suffix})"
+                                f"⏳ Token bucket empty — pacing {bucket_wait:.1f}s "
+                                f"(cost={token_cost:.1f} for {file_size_mb:.1f}MB)"
                             )
-                            job.message = f"⏳ Batch cooldown — resting {cooldown_secs}s ({local_processed}/{total} done)..."
-                            await notify_buddystore(webhook_url, {
-                                "jobId": job.job_id, "adminId": job.admin_id,
-                                "status": "running",
-                                "progress": local_processed, "total": total,
-                                "message": job.message,
-                                "logs": job.logs[-100:],
-                                "checkpointMsgId": local_chk,
-                                "floodWaitCount": flood_wait_count,
-                                "floodWaitTotalSeconds": flood_wait_total_seconds,
-                                "currentDelay": dynamic_delay,
-                            })
-                            await asyncio.sleep(cooldown_secs)
-                            job.add_log("▶️ Batch cooldown complete. Continuing import...")
-                        else:
-                            await notify_buddystore(webhook_url, {
-                                "jobId": job.job_id, "adminId": job.admin_id,
-                                "status": "running",
-                                "progress": local_processed, "total": total,
-                                "message": f"Imported {local_processed}/{total} videos{fw_suffix}",
-                                "logs": job.logs[-100:],
-                                "checkpointMsgId": local_chk,
-                                "floodWaitCount": flood_wait_count,
-                                "floodWaitTotalSeconds": flood_wait_total_seconds,
-                                "currentDelay": dynamic_delay,
-                            })
-                            await asyncio.sleep(dynamic_delay)
+                            await asyncio.sleep(bucket_wait)
+
+                        await notify_buddystore(webhook_url, {
+                            "jobId": job.job_id, "adminId": job.admin_id,
+                            "status": "running",
+                            "progress": local_processed, "total": total,
+                            "message": f"Imported {local_processed}/{total} videos{fw_suffix}{dc_suffix}{premium_flag}",
+                            "logs": job.logs[-100:],
+                            "checkpointMsgId": local_chk,
+                            "floodWaitCount": flood_wait_count,
+                            "floodWaitTotalSeconds": flood_wait_total_seconds,
+                            "isPremium": is_premium,
+                            "sourceDcId": source_dc_id,
+                            "sourceDcName": DC_NAMES.get(source_dc_id, None) if source_dc_id else None,
+                            "bucketLevel": bucket.level_pct,
+                        })
 
                 except FloodWait as fw:
                     wait = fw.value + 3
@@ -742,7 +864,11 @@ async def _run_import_inner(
                         f"(FloodWait #{flood_wait_count}, {fw_mins}m {fw_secs}s total this session)"
                     )
 
-                    # ── Dynamic concurrency reduction (#5) ────────────────────────
+                    # ── Penalize token bucket ─────────────────────────────────────
+                    await bucket.penalize(fw.value)
+                    job.add_log(f"{tag} 💧 Token bucket penalized by FloodWait — bucket at {bucket.level_pct}%")
+
+                    # ── Dynamic concurrency reduction ─────────────────────────────
                     # After 10 FloodWaits, drop to 1 concurrent download to relieve
                     # API pressure. Rebuild the semaphore with the new limit.
                     if flood_wait_count >= 10 and not _concurrency_reduced:
@@ -765,6 +891,8 @@ async def _run_import_inner(
                             "checkpointMsgId": latest_checkpoint_msg_id,
                             "floodWaitCount": flood_wait_count,
                             "floodWaitTotalSeconds": flood_wait_total_seconds,
+                            "isPremium": is_premium,
+                            "sourceDcId": source_dc_id,
                         })
                         return
 
@@ -875,6 +1003,7 @@ async def _run_import_inner(
         if not job.stop_flag:
             job.status = "completed"
             job.message = f"✅ Import complete — {processed}/{total} videos imported."
+            _clear_local_checkpoint(job.job_id)
 
         await notify_buddystore(webhook_url, {
             "jobId": job.job_id, "adminId": job.admin_id,
@@ -883,6 +1012,9 @@ async def _run_import_inner(
             "message": job.message,
             "logs": job.logs[-200:],
             "checkpointMsgId": latest_checkpoint_msg_id,
+            "isPremium": is_premium,
+            "sourceDcId": source_dc_id,
+            "sourceDcName": DC_NAMES.get(source_dc_id, None) if source_dc_id else None,
         })
 
 async def run_import(
