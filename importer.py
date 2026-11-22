@@ -441,18 +441,21 @@ def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
 # Applied ONLY on the CHAT_FORWARDS_RESTRICTED reupload path (file is on disk).
 # Server-side copies bypass this — Telegram handles those bytes, we never touch them.
 #
-# Resolution-aware filter selection (safe for t2.micro 1 GB RAM):
-#   ≤ 480p  → denoise + sharpen + 2× Lanczos upscale  (~120-180 MB RAM, ~1-4 min)
-#   ≥ 720p  → denoise + sharpen only (no upscale)       (~80-150 MB RAM, ~30s-2 min)
-#   > 80 MB → skip entirely, upload original             (OOM/timeout risk)
+# Filter chain (denoise + sharpen only — NO upscale):
+#   hqdn3d=4:3:6:4.5  — temporal + spatial denoiser (removes compression artifacts)
+#   unsharp=5:5:1.0    — edge sharpening
 #
-# Falls back silently to original file on any ffmpeg error.
-# Uses -preset fast + -crf 20 for good quality / reasonable encode time.
-# Returns (enhanced_path, new_width, new_height) or (None, orig_w, orig_h).
+# Why no upscale:
+#   2× Lanczos on t2.micro takes 1-5 min per video, balloons file size 5-10×,
+#   and Telegram re-compresses the upload anyway — zero visible gain.
+#   Denoise+sharpen alone runs in 10-20s and genuinely cleans old compressed video.
+#
+# Limits:
+#   • Skipped if video > ENHANCE_MAX_SIZE_MB (default 80 MB) — prevents OOM/timeout
+#   • Falls back silently to original file on any ffmpeg error
+#   • Uses -preset fast and -crf 20 for good quality / fast encode
 
-ENHANCE_MAX_SIZE_MB = 80   # skip enhancement for files larger than this
-UPSCALE_MAX_WIDTH   = 1280  # skip 2× upscale if input width  >= this (720p+)
-UPSCALE_MAX_HEIGHT  = 720   # skip 2× upscale if input height >= this (720p+)
+ENHANCE_MAX_SIZE_MB = 80  # skip enhancement for files larger than this
 
 def enhance_video_ffmpeg(
     video_path: str,
@@ -462,11 +465,8 @@ def enhance_video_ffmpeg(
     tag: str = "",
 ) -> tuple[str | None, int, int]:
     """
-    Run resolution-aware ffmpeg enhancement on video_path.
-    - ≤480p : denoise + sharpen + 2× Lanczos upscale  (safe on t2.micro)
-    - ≥720p : denoise + sharpen only, no upscale       (avoids OOM)
-    - >80 MB: skipped entirely                          (prevents timeout)
-    Returns (enhanced_path, new_w, new_h) if successful, (None, orig_w, orig_h) on skip/fail.
+    Run ffmpeg denoise + sharpen on video_path (no upscale — too slow on t2.micro).
+    Returns (enhanced_path, orig_w, orig_h) if successful, (None, orig_w, orig_h) on skip/fail.
     Caller is responsible for deleting enhanced_path when done.
     """
     try:
@@ -483,28 +483,10 @@ def enhance_video_ffmpeg(
             )
         return None, orig_width, orig_height
 
-    # ── Resolution-aware filter selection ────────────────────────────────────
-    # 720p+ → skip 2× upscale (output would be 1440p/4K — OOM risk on t2.micro)
-    # ≤480p → full pipeline with 2× Lanczos upscale
-    is_hd = (orig_width >= UPSCALE_MAX_WIDTH or orig_height >= UPSCALE_MAX_HEIGHT)
-
-    if is_hd:
-        # Denoise + sharpen only — safe even for 1080p on 1 GB RAM
-        vf_filter = "hqdn3d=4:3:6:4.5,unsharp=5:5:1.0"
-        enhance_label = "denoise+sharpen"
-        new_w, new_h = orig_width, orig_height   # resolution unchanged
-    else:
-        # Full pipeline: denoise + sharpen + 2× Lanczos upscale
-        vf_filter = "hqdn3d=4:3:6:4.5,unsharp=5:5:1.0,scale=iw*2:ih*2:flags=lanczos"
-        enhance_label = "denoise+sharpen+2× upscale"
-        new_w = orig_width * 2 if orig_width else 0
-        new_h = orig_height * 2 if orig_height else 0
-
     if job_add_log:
-        mode = f"{'HD — no upscale' if is_hd else 'SD — full upscale'}"
         job_add_log(
             f"{tag} 🎬 Enhancing ({orig_width}×{orig_height}, {file_size_mb:.1f} MB) "
-            f"— mode: {mode} ({enhance_label})"
+            f"— denoise + sharpen"
         )
 
     enhanced_path = video_path.replace(".tmp", "_enhanced.mp4")
@@ -516,17 +498,17 @@ def enhance_video_ffmpeg(
             [
                 "ffmpeg", "-y",
                 "-i", video_path,
-                "-vf", vf_filter,
+                "-vf", "hqdn3d=4:3:6:4.5,unsharp=5:5:1.0",  # denoise + sharpen, NO upscale
                 "-c:v", "libx264",
                 "-crf", "20",
                 "-preset", "fast",
-                "-c:a", "copy",             # audio passthrough — no re-encode overhead
+                "-c:a", "copy",             # audio passthrough
                 "-movflags", "+faststart",   # web-optimized MP4
                 enhanced_path,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=600,  # 10 min max
+            timeout=300,  # 5 min max (denoise+sharpen on 80MB is well within this)
         )
         if result.returncode != 0:
             err = result.stderr[-300:].decode(errors="ignore") if result.stderr else "unknown"
@@ -543,9 +525,9 @@ def enhance_video_ffmpeg(
         if job_add_log:
             job_add_log(
                 f"{tag} ✨ Enhanced: {file_size_mb:.1f} MB → {new_size_mb:.1f} MB "
-                f"({orig_width}×{orig_height} → {new_w}×{new_h}, {enhance_label})"
+                f"({orig_width}×{orig_height}, denoise+sharpen)"
             )
-        return enhanced_path, new_w, new_h
+        return enhanced_path, orig_width, orig_height
 
     except FileNotFoundError:
         if job_add_log:
@@ -553,7 +535,7 @@ def enhance_video_ffmpeg(
         return None, orig_width, orig_height
     except subprocess.TimeoutExpired:
         if job_add_log:
-            job_add_log(f"{tag} ⚠️ ffmpeg timed out (>10 min) — using original file")
+            job_add_log(f"{tag} ⚠️ ffmpeg timed out (>5 min) — using original file")
         if os.path.exists(enhanced_path):
             try:
                 os.unlink(enhanced_path)
