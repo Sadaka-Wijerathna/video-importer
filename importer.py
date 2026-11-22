@@ -4,7 +4,9 @@
 #           EOF retry, token-bucket rate limiter, webhook progress callbacks,
 #           scan result cache, bounded task queue, adaptive concurrency,
 #           drop_author server-side copy, Premium detection, DC logging,
-#           local checkpoint persistence.
+#           local checkpoint persistence,
+#           ffmpeg video enhancement (denoise + sharpen + 2× upscale)
+#           on CHAT_FORWARDS_RESTRICTED reupload path.
 
 import os
 import json
@@ -435,6 +437,108 @@ def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
         return None
 
 
+# ── Video enhancer (ffmpeg CPU filters) ───────────────────────────────────────
+# Applied ONLY on the CHAT_FORWARDS_RESTRICTED reupload path (file is on disk).
+# Server-side copies bypass this — Telegram handles those bytes, we never touch them.
+#
+# Filter chain:
+#   hqdn3d=4:3:6:4.5  — temporal + spatial denoiser (removes compression artifacts)
+#   unsharp=5:5:1.0    — edge sharpening (compensates for Lanczos softness)
+#   scale=iw*2:ih*2:flags=lanczos — 2× upscale via Lanczos (decent, no AI needed)
+#
+# Limits:
+#   • Skipped if video > ENHANCE_MAX_SIZE_MB (default 80 MB) — prevents OOM/timeout on t2.micro
+#   • Falls back silently to original file on any ffmpeg error
+#   • Uses -preset fast and -crf 20 for good quality / reasonable encode time
+#   • Returns (enhanced_path, new_width, new_height) or (None, orig_w, orig_h)
+
+ENHANCE_MAX_SIZE_MB = 80  # skip enhancement for files larger than this
+
+def enhance_video_ffmpeg(
+    video_path: str,
+    orig_width: int,
+    orig_height: int,
+    job_add_log=None,
+    tag: str = "",
+) -> tuple[str | None, int, int]:
+    """
+    Run ffmpeg denoise + sharpen + 2× upscale on video_path.
+    Returns (enhanced_path, new_w, new_h) if successful, (None, orig_w, orig_h) on skip/fail.
+    The caller is responsible for deleting enhanced_path when done.
+    """
+    try:
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    except Exception:
+        return None, orig_width, orig_height
+
+    if file_size_mb > ENHANCE_MAX_SIZE_MB:
+        if job_add_log:
+            job_add_log(f"{tag} 🎬 Enhancement skipped — file too large ({file_size_mb:.1f} MB > {ENHANCE_MAX_SIZE_MB} MB limit)")
+        return None, orig_width, orig_height
+
+    enhanced_path = video_path.replace(".tmp", "_enhanced.mp4")
+    if enhanced_path == video_path:
+        enhanced_path = video_path + "_enhanced.mp4"
+
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-vf", "hqdn3d=4:3:6:4.5,unsharp=5:5:1.0,scale=iw*2:ih*2:flags=lanczos",
+                "-c:v", "libx264",
+                "-crf", "20",
+                "-preset", "fast",
+                "-c:a", "copy",          # audio passthrough — no re-encode
+                "-movflags", "+faststart",  # web-optimized MP4
+                enhanced_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=600,  # 10 min max — a 2-min 80MB video takes ~3-7 min on t2.micro
+        )
+        if result.returncode != 0:
+            err = result.stderr[-300:].decode(errors="ignore") if result.stderr else "unknown"
+            if job_add_log:
+                job_add_log(f"{tag} ⚠️ ffmpeg enhancement failed (rc={result.returncode}) — using original. {err}")
+            if os.path.exists(enhanced_path):
+                os.unlink(enhanced_path)
+            return None, orig_width, orig_height
+
+        new_size_mb = os.path.getsize(enhanced_path) / (1024 * 1024)
+        new_w = orig_width * 2 if orig_width else 0
+        new_h = orig_height * 2 if orig_height else 0
+        if job_add_log:
+            job_add_log(
+                f"{tag} ✨ Enhanced: {file_size_mb:.1f} MB → {new_size_mb:.1f} MB "
+                f"({orig_width}×{orig_height} → {new_w}×{new_h}, denoise+sharpen+2× Lanczos)"
+            )
+        return enhanced_path, new_w, new_h
+
+    except FileNotFoundError:
+        if job_add_log:
+            job_add_log(f"{tag} ⚠️ ffmpeg not installed — enhancement skipped")
+        return None, orig_width, orig_height
+    except subprocess.TimeoutExpired:
+        if job_add_log:
+            job_add_log(f"{tag} ⚠️ ffmpeg timed out (>10 min) — using original file")
+        if os.path.exists(enhanced_path):
+            try:
+                os.unlink(enhanced_path)
+            except Exception:
+                pass
+        return None, orig_width, orig_height
+    except Exception as e:
+        if job_add_log:
+            job_add_log(f"{tag} ⚠️ Enhancement error: {e} — using original")
+        if os.path.exists(enhanced_path):
+            try:
+                os.unlink(enhanced_path)
+            except Exception:
+                pass
+        return None, orig_width, orig_height
+
+
 # ── Main import loop ───────────────────────────────────────────────────────────
 
 async def _run_import_inner(
@@ -683,6 +787,7 @@ async def _run_import_inner(
                 attempts += 1
                 tmp_file: str | None = None
                 thumb_file: str | None = None
+                enhanced_file: str | None = None
 
                 try:
                     # ── Phase 1: Download & prepare media (Parallel between workers) ──
@@ -789,21 +894,43 @@ async def _run_import_inner(
                                 if not thumb_file and tmp_file and os.path.exists(tmp_file):
                                     thumb_file = generate_thumbnail_ffmpeg(tmp_file, f"{tmp_prefix}_thumb.jpg")
 
-                            job.message = f"{tag} Uploading ({file_size_mb:.1f} MB)..."
+                            # ── ffmpeg enhancement (denoise + sharpen + 2× upscale) ───────
+                            # Only on the restricted-channel reupload path.
+                            # Runs in a thread executor so asyncio event loop stays unblocked.
+                            # Falls back silently to original if ffmpeg fails/times out.
+                            job.message = f"{tag} Enhancing ({file_size_mb:.1f} MB)..."
+                            loop = asyncio.get_event_loop()
+                            enhanced_path, upload_w, upload_h = await loop.run_in_executor(
+                                None,
+                                enhance_video_ffmpeg,
+                                tmp_file, width, height, job.add_log, tag,
+                            )
+                            if enhanced_path and os.path.exists(enhanced_path):
+                                enhanced_file = enhanced_path   # track for finally cleanup
+                                upload_video = enhanced_file
+                                enhanced_mb = os.path.getsize(enhanced_file) / (1024 * 1024)
+                            else:
+                                upload_video = tmp_file
+                                upload_w, upload_h = width, height
+                                enhanced_mb = file_size_mb
+                            # ─────────────────────────────────────────────────────────────
+
+                            job.message = f"{tag} Uploading ({enhanced_mb:.1f} MB)..."
                             send_kwargs: dict = dict(
                                 chat_id=tgt_peer,
-                                video=tmp_file,
+                                video=upload_video,
                                 caption=caption,
                                 duration=duration,
-                                width=width,
-                                height=height,
+                                width=upload_w,
+                                height=upload_h,
                                 supports_streaming=True,
                             )
                             if thumb_file and os.path.exists(thumb_file):
                                 send_kwargs["thumb"] = thumb_file
 
                             await tg.send_video(**send_kwargs)
-                            job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB)")
+                            enhanced_label = " (✨ enhanced)" if enhanced_file else ""
+                            job.add_log(f"{tag} ✅ Imported ({enhanced_mb:.1f} MB){enhanced_label}")
                             success = True
 
                         # ── Post-Upload: Token Bucket pacing + checkpoint + webhook ──
@@ -968,7 +1095,7 @@ async def _run_import_inner(
                         await advance_checkpoint(list_idx)
 
                 finally:
-                    for f in [tmp_file, thumb_file]:
+                    for f in [tmp_file, thumb_file, enhanced_file]:
                         if f and os.path.exists(f):
                             try:
                                 os.unlink(f)
