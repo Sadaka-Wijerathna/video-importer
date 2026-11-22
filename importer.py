@@ -441,14 +441,15 @@ def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
 # Applied ONLY on the CHAT_FORWARDS_RESTRICTED reupload path (file is on disk).
 # Server-side copies bypass this — Telegram handles those bytes, we never touch them.
 #
-# Filter chain (denoise + sharpen only — NO upscale):
-#   hqdn3d=4:3:6:4.5  — temporal + spatial denoiser (removes compression artifacts)
-#   unsharp=5:5:1.0    — edge sharpening
+# Filter chain (color-enhanced — no upscale, safe on t2.micro):
+#   hqdn3d=2:1:3:3        — light denoiser (removes compression grain without blurring detail)
+#   eq=contrast/sat/gamma — boosts contrast 1.08×, saturation 1.25×, slight brightness lift
+#   unsharp=5:5:1.2       — stronger edge sharpening for a crisper look
 #
 # Why no upscale:
 #   2× Lanczos on t2.micro takes 1-5 min per video, balloons file size 5-10×,
 #   and Telegram re-compresses the upload anyway — zero visible gain.
-#   Denoise+sharpen alone runs in 10-20s and genuinely cleans old compressed video.
+#   Color/contrast enhancement survives Telegram's re-encode and is visually noticeable.
 #
 # Limits:
 #   • Skipped if video > ENHANCE_MAX_SIZE_MB (default 80 MB) — prevents OOM/timeout
@@ -486,7 +487,7 @@ def enhance_video_ffmpeg(
     if job_add_log:
         job_add_log(
             f"{tag} 🎬 Enhancing ({orig_width}×{orig_height}, {file_size_mb:.1f} MB) "
-            f"— denoise + sharpen"
+            f"— denoise + color boost + sharpen"
         )
 
     enhanced_path = video_path.replace(".tmp", "_enhanced.mp4")
@@ -498,7 +499,7 @@ def enhance_video_ffmpeg(
             [
                 "ffmpeg", "-y",
                 "-i", video_path,
-                "-vf", "hqdn3d=4:3:6:4.5,unsharp=5:5:1.0",  # denoise + sharpen, NO upscale
+                "-vf", "hqdn3d=2:1:3:3,eq=contrast=1.08:brightness=0.015:saturation=1.25:gamma=1.05,unsharp=5:5:1.2:3:3:0.5",
                 "-c:v", "libx264",
                 "-crf", "20",
                 "-preset", "fast",
@@ -525,7 +526,7 @@ def enhance_video_ffmpeg(
         if job_add_log:
             job_add_log(
                 f"{tag} ✨ Enhanced: {file_size_mb:.1f} MB → {new_size_mb:.1f} MB "
-                f"({orig_width}×{orig_height}, denoise+sharpen)"
+                f"({orig_width}×{orig_height}, denoise+color boost+sharpen)"
             )
         return enhanced_path, orig_width, orig_height
 
