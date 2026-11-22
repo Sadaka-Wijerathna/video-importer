@@ -893,13 +893,6 @@ async def _run_import_inner(
                                         random_id=[random.randint(0, 2**63)],
                                         drop_author=True,          # no "Forwarded from X" banner
                                         drop_media_captions=False,
-                                        with_my_score=False,
-                                        grouped=False,
-                                        background=False,
-                                        silent=False,
-                                        noforwards=False,
-                                        schedule_date=None,
-                                        send_as=None,
                                     )
                                 )
                                 job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB) — server-side copy")
