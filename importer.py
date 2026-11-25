@@ -806,6 +806,13 @@ async def _run_import_inner(
                             return
 
                         forward_done = False
+                        # ── Re-check restriction flag at upload time ──────────────────
+                        # can_try_forward was computed in Phase 1. If another worker hit
+                        # CHAT_FORWARDS_RESTRICTED between Phase 1 and Phase 2, the flag
+                        # will now be True — re-evaluate so we don't waste a ForwardMessages
+                        # attempt and correctly route to the download+reupload path.
+                        if channel_forwards_restricted:
+                            can_try_forward = False
                         if can_try_forward:
                             try:
                                 # ── drop_author=True: server-side copy, no "Forwarded from" label ──
