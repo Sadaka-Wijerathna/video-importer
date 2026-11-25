@@ -851,6 +851,12 @@ async def _run_import_inner(
                                 job.add_log(f"{tag} ✅ Imported ({file_size_mb:.1f} MB) — server-side copy")
                                 forward_done = True
                                 success = True
+                                # ── Forward rate safety delay ─────────────────────────────
+                                # ForwardMessages uses no upload bandwidth so the token bucket
+                                # alone would allow 60+ forwards/sec in a burst — far above
+                                # Telegram's safe ~20 forwards/min per account.
+                                # A fixed 3s floor caps forward rate at ~20/min safely.
+                                await asyncio.sleep(3.0)
                             except Exception as fwd_err:
                                 fwd_msg = str(fwd_err)
                                 if "CHAT_FORWARDS_RESTRICTED" in fwd_msg or "you can't forward" in fwd_msg.lower() or "forbidden" in fwd_msg.lower():
