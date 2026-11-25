@@ -436,18 +436,20 @@ def generate_thumbnail_ffmpeg(video_path: str, thumb_path: str) -> str | None:
 
 
 # ── Thumbnail watermark ────────────────────────────────────────────────────────
-# Burns a professional @BuddySeller badge into the thumbnail JPEG only.
+# Burns a professional watermark into the thumbnail JPEG only.
 # Single image processing = ~0.3–0.5s, negligible impact on import speed.
 # Applied to ALL videos (both server-side copy and restricted reupload paths).
 #
-# Design: bottom-right corner, dark semi-transparent pill, clean white text.
-# Mimics YouTube channel watermark style — subtle but always visible.
+# Layout:
+#   CENTER      — @BuddySeller  (large, bold, dark pill background)
+#   LOWER-CENTER— INTERNAL USE ONLY  (small spaced caps, no box)
 
-WATERMARK_TEXT = "@BuddySeller"
+WATERMARK_TEXT  = "@BuddySeller"
+WATERMARK_SUB   = "I N T E R N A L   U S E   O N L Y"
 
 def watermark_thumbnail(thumb_path: str) -> None:
     """
-    Burn @BuddySeller watermark into thumbnail JPEG in-place.
+    Burn dual watermark into thumbnail JPEG in-place.
     Silently no-ops on any error — never breaks the import flow.
     """
     if not thumb_path or not os.path.exists(thumb_path):
@@ -455,27 +457,28 @@ def watermark_thumbnail(thumb_path: str) -> None:
 
     tmp_wm = thumb_path + "_wm.jpg"
     try:
-        # Professional bottom-right badge:
-        #   box=1              — dark pill background behind text
-        #   boxcolor=0x000000@0.45 — 45% opacity black box (subtle, not heavy)
-        #   boxborderw=8       — 8px padding inside pill for breathing room
-        #   fontcolor=white@0.90 — 90% white — crisp but not harsh
-        #   fontsize=15        — readable on 320px thumbnail, not oversized
-        #   x=W-tw-14          — 14px from right edge
-        #   y=H-th-10          — 10px from bottom edge
+        # Two drawtext filters chained:
+        # 1. @BuddySeller — center, large, white text, dark semi-transparent pill
+        # 2. INTERNAL USE ONLY — lower center, small spaced caps, no box
+        vf = (
+            # ── Main brand text ──────────────────────────────────────
+            f"drawtext=text='{WATERMARK_TEXT}'"
+            ":fontsize=22"
+            ":fontcolor=white@0.92"
+            ":x=(W-tw)/2:y=(H-th)/2"           # exact center
+            ":box=1:boxcolor=0x000000@0.42:boxborderw=12"
+            # ── Sub text ─────────────────────────────────────────────
+            f",drawtext=text='{WATERMARK_SUB}'"
+            ":fontsize=9"
+            ":fontcolor=white@0.65"
+            ":x=(W-tw)/2:y=H-th-12"            # lower center, 12px from bottom
+        )
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", thumb_path,
-                "-vf",
-                (
-                    f"drawtext=text='{WATERMARK_TEXT}'"
-                    ":fontsize=15"
-                    ":fontcolor=white@0.90"
-                    ":x=W-tw-14:y=H-th-10"
-                    ":box=1:boxcolor=0x000000@0.45:boxborderw=8"
-                ),
-                "-q:v", "3",   # JPEG quality — keep it sharp
+                "-vf", vf,
+                "-q:v", "3",
                 tmp_wm,
             ],
             stdout=subprocess.DEVNULL,
@@ -484,7 +487,7 @@ def watermark_thumbnail(thumb_path: str) -> None:
         )
         if result.returncode == 0 and os.path.exists(tmp_wm):
             if os.path.getsize(tmp_wm) <= 200 * 1024:
-                os.replace(tmp_wm, thumb_path)   # atomic in-place replace
+                os.replace(tmp_wm, thumb_path)
     except Exception:
         pass
     finally:
