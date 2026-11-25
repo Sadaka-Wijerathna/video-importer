@@ -653,6 +653,26 @@ async def _run_import_inner(
             })
             return
 
+        # ── Target bot pre-validation ─────────────────────────────────────────
+        # Resolve the target peer BEFORE starting the import loop.
+        # If the bot username is wrong (USERNAME_NOT_OCCUPIED / PEER_ID_INVALID),
+        # we fail fast with a clear message instead of failing 994× in a loop.
+        try:
+            await tg.resolve_peer(tgt_peer)
+        except Exception as e:
+            err_str = str(e)
+            job.status = "failed"
+            job.message = f"❌ Target bot '{target_chat}' could not be resolved: {err_str[:120]}"
+            job.add_log(f"❌ ABORT — cannot resolve target bot '{target_chat}': {err_str[:120]}")
+            job.add_log("💡 Check that the bot username is correct and that you have started it at least once.")
+            await notify_buddystore(webhook_url, {
+                "jobId": job.job_id, "adminId": job.admin_id,
+                "status": "failed", "progress": 0, "total": total,
+                "message": job.message,
+                "logs": job.logs[-100:],
+            })
+            return
+
         job.add_log(f"Starting import: {total} videos.")
         await notify_buddystore(webhook_url, {
             "jobId": job.job_id, "adminId": job.admin_id,
@@ -1028,8 +1048,21 @@ async def _run_import_inner(
                         await asyncio.sleep(backoff)
                     else:
                         job.add_log(f"{tag} ❌ Failed — {err_msg[:100]}")
-                        success = True
-                        await advance_checkpoint(list_idx)
+                        success = True  # mark done so the while loop exits
+                        # ── Count failed videos in progress so the bar moves ──────
+                        async with checkpoint_lock:
+                            processed += 1
+                            job.progress = processed
+                            cur_failed = processed
+                        chk = await advance_checkpoint(list_idx)
+                        await notify_buddystore(webhook_url, {
+                            "jobId": job.job_id, "adminId": job.admin_id,
+                            "status": "running",
+                            "progress": cur_failed, "total": total,
+                            "message": f"Processing {cur_failed}/{total} videos...",
+                            "logs": job.logs[-100:],
+                            "checkpointMsgId": chk,
+                        })
 
                 finally:
                     for f in [tmp_file, thumb_file]:
